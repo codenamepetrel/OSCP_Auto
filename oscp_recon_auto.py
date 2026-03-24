@@ -1,4 +1,8 @@
 #!/usr/bin/env python3
+
+#Install Auto Recon
+#pip3 install git+https://github.com/Tib3rius/AutoRecon.git
+
 """
 oscp_recon_auto.py — OSCP Recon Automation
   1. RustScan  → fast TCP port discovery
