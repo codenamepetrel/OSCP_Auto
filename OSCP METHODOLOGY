@@ -1,0 +1,85 @@
+OSCP METHODOLOGY - IDENTIFYING AND EXPLOITING UNKNOWN VULNERABILITIES
+STEP 1 - IDENTIFY THE SOFTWARE AND VERSION
+When you find a web page or service, always ask "what is this running?"
+
+Check the page title
+Check the login page for version numbers
+Check HTTP response headers: curl -I http://TARGET
+Check page source for version info
+Check /readme.txt, /changelog.txt, /license.txt
+
+STEP 2 - GOOGLE IT
+Search for:
+
+"SOFTWARE NAME exploit"
+"SOFTWARE NAME vulnerability"
+"SOFTWARE NAME CVE"
+"SOFTWARE NAME VERSION exploit"
+Example: "UniFi Network Controller 6.4.54 exploit"
+
+STEP 3 - SEARCHSPLOIT
+searchsploit unifi
+searchsploit "unifi network"
+searchsploit apache 2.4.29
+searchsploit openssh 8.1
+To copy an exploit to your current directory:
+searchsploit -m 45233
+STEP 4 - CHECK EXPLOIT-DB ONLINE
+Go to https://exploit-db.com
+Search the software name and version
+Download PoC code directly
+STEP 5 - CHECK HACKTRICKS
+Website: https://book.hacktricks.xyz
+Google search trick: site:book.hacktricks.xyz unifi
+Good pages to bookmark:
+
+https://book.hacktricks.xyz/linux-hardening/privilege-escalation
+https://book.hacktricks.xyz/windows-hardening/windows-local-privilege-escalation
+https://book.hacktricks.xyz/pentesting-web/file-inclusion
+
+STEP 6 - CLONE RESOURCES LOCALLY FOR OFFLINE USE
+git clone https://github.com/carlospolop/hacktricks
+git clone https://github.com/swisskyrepo/PayloadsAllTheThings
+Search them offline:
+grep -r "unifi" hacktricks/ --include=".md"
+grep -r "log4j" hacktricks/ --include=".md"
+grep -r "lxd" hacktricks/ --include="*.md"
+
+OSCP GENERAL ENUMERATION CHECKLIST
+PORT SCANNING:
+nmap -sV -sC -p- TARGET -o nmap_full.txt
+rustscan -a TARGET -- -sV -sC
+WEB ENUMERATION:
+gobuster dir -u http://TARGET -w /usr/share/wordlists/dirb/common.txt -x php,html,txt
+nikto -h http://TARGET
+curl -I http://TARGET
+curl -L http://TARGET/robots.txt
+curl -L http://TARGET/sitemap.xml
+IDENTIFY CMS:
+wpscan --url http://TARGET --enumerate (WordPress)
+droopescan scan drupal -u http://TARGET (Drupal)
+joomscan -u http://TARGET (Joomla)
+
+USEFUL RESOURCES TO BOOKMARK
+https://book.hacktricks.xyz - General hacking techniques
+https://gtfobins.github.io - Linux sudo/SUID privesc binaries
+https://lolbas-project.github.io - Windows living off the land binaries
+https://exploit-db.com - Exploit database
+https://nvd.nist.gov - CVE database
+https://github.com/swisskyrepo/PayloadsAllTheThings - Payload lists
+https://crackstation.net - Online hash cracking
+https://revshells.com - Reverse shell generator
+
+PRIVILEGE ESCALATION QUICK REFERENCE
+LINUX:
+sudo -l (what can I run as root?)
+find / -perm -4000 2>/dev/null (SUID binaries)
+cat /etc/crontab (cron jobs)
+id (what groups am I in?)
+uname -a (kernel version - check for kernel exploits)
+WINDOWS:
+whoami /priv (check privileges)
+whoami /groups (check groups)
+systeminfo (OS version - check for exploits)
+net user (list users)
+net localgroup administrators (who is admin?)
