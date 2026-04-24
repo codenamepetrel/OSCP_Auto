@@ -2,8 +2,8 @@
 
 ##############################################
 ## Freeworld - Allergic to aluminum baby   ##
-## Web Port Auto Scanner                   ##
-## Usage: python3 scanport.py <IP> <PORT>  ##
+## Enum Blaster Auto Scanner                   ##
+## Usage: python3 blasterEnum.py <IP> <PORT>  ##
 ##############################################
 
 import subprocess
